@@ -67,7 +67,12 @@ async def main(ui_queue=None, bot_settings=None):
     latest_row_data = None
     
     if bot_settings is None:
-        bot_settings = {"profit_threshold": 5.0, "cooldown_minutes": 60.0}
+        bot_settings = {
+            "profit_threshold": 5.0, 
+            "cooldown_minutes": 60.0,
+            "initial_stake": 5.0,
+            "growth_rate": 0.05
+        }
         
     session_profit = 0.0
     is_in_cooldown = False
@@ -105,7 +110,8 @@ async def main(ui_queue=None, bot_settings=None):
         tick_volatility = float(latest_row['tick_volatility_14'])
         
         # 4b. Strategy Engine (Entry Logic)
-        stake = risk_manager.calculate_stake(current_capital=1000.0)
+        stake = float(bot_settings.get("initial_stake", 5.0))
+        current_growth_rate = float(bot_settings.get("growth_rate", 0.05))
         
         # STRATEGY CONDITIONS:
         absolute_bb_width = latest_bbu - latest_bbl
@@ -173,7 +179,7 @@ Probabilité danger: {prob_danger:.2%}
         if signal_detected and is_ai_favorable:
             logger.info(log_msg + "BUY\n")
             
-            expected_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + GROWTH_RATE))
+            expected_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + current_growth_rate))
             logger.info(f"ACCUMULATOR Squeeze + ML SAFE! Entering trade.")
             logger.info(f"Estimated duration to hit {TAKE_PROFIT_PERCENT}% TP: ~{expected_ticks} ticks")
             
@@ -182,7 +188,7 @@ Probabilité danger: {prob_danger:.2%}
                 symbol=SYMBOL, 
                 contract_type="ACCU", 
                 stake=stake, 
-                growth_rate=GROWTH_RATE,
+                growth_rate=current_growth_rate,
                 limit_order={"take_profit": tp_amount} # Native TP
             )
             

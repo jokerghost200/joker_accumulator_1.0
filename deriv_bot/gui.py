@@ -38,7 +38,9 @@ class DerivBotApp(ctk.CTk):
         # Shared settings dict for the bot
         self.bot_settings = {
             "profit_threshold": 5.0,
-            "cooldown_minutes": 60.0
+            "cooldown_minutes": 60.0,
+            "initial_stake": 5.0,
+            "growth_rate": 0.05
         }
 
         # --- Sidebar Controls ---
@@ -52,6 +54,16 @@ class DerivBotApp(ctk.CTk):
         # --- Settings Panel ---
         self.settings_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
         self.settings_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        
+        ctk.CTkLabel(self.settings_frame, text="Mise Initiale ($):").pack(anchor="w", padx=10)
+        self.entry_stake = ctk.CTkEntry(self.settings_frame, width=150)
+        self.entry_stake.insert(0, str(self.bot_settings["initial_stake"]))
+        self.entry_stake.pack(padx=10, pady=(0, 5))
+        
+        ctk.CTkLabel(self.settings_frame, text="Taux de Croissance:").pack(anchor="w", padx=10)
+        self.combo_growth = ctk.CTkComboBox(self.settings_frame, values=["1%", "2%", "3%", "4%", "5%"], width=150)
+        self.combo_growth.set(f"{int(self.bot_settings['growth_rate']*100)}%")
+        self.combo_growth.pack(padx=10, pady=(0, 5))
         
         ctk.CTkLabel(self.settings_frame, text="Profit Target ($):").pack(anchor="w", padx=10)
         self.entry_profit = ctk.CTkEntry(self.settings_frame, width=150)
@@ -139,9 +151,16 @@ class DerivBotApp(ctk.CTk):
         try:
             target = float(self.entry_profit.get())
             cooldown = float(self.entry_cooldown.get())
+            stake = float(self.entry_stake.get())
+            growth_str = self.combo_growth.get().replace("%", "")
+            growth = float(growth_str) / 100.0
+            
             self.bot_settings["profit_threshold"] = target
             self.bot_settings["cooldown_minutes"] = cooldown
-            self.log_message(f"[Settings] Updated: Target={target}$, Cooldown={cooldown}m")
+            self.bot_settings["initial_stake"] = stake
+            self.bot_settings["growth_rate"] = growth
+            
+            self.log_message(f"[Settings] Updated: Stake={stake}$, Growth={growth*100}%, Target={target}$, Cooldown={cooldown}m")
         except ValueError:
             self.log_message("[Error] Invalid settings values. Please enter numbers.")
 
