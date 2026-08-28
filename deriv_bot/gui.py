@@ -34,6 +34,12 @@ class DerivBotApp(ctk.CTk):
         self.ui_queue = queue.Queue()
         self.bot_thread = None
         self.is_running = False
+        
+        # Shared settings dict for the bot
+        self.bot_settings = {
+            "profit_threshold": 5.0,
+            "cooldown_minutes": 60.0
+        }
 
         # --- Sidebar Controls ---
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
@@ -43,14 +49,35 @@ class DerivBotApp(ctk.CTk):
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Sniper Bot", font=ctk.CTkFont(size=20, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
+        # --- Settings Panel ---
+        self.settings_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.settings_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        
+        ctk.CTkLabel(self.settings_frame, text="Profit Target ($):").pack(anchor="w", padx=10)
+        self.entry_profit = ctk.CTkEntry(self.settings_frame, width=150)
+        self.entry_profit.insert(0, str(self.bot_settings["profit_threshold"]))
+        self.entry_profit.pack(padx=10, pady=(0, 5))
+        
+        ctk.CTkLabel(self.settings_frame, text="Cooldown (mins):").pack(anchor="w", padx=10)
+        self.entry_cooldown = ctk.CTkEntry(self.settings_frame, width=150)
+        self.entry_cooldown.insert(0, str(self.bot_settings["cooldown_minutes"]))
+        self.entry_cooldown.pack(padx=10, pady=(0, 10))
+        
+        self.apply_btn = ctk.CTkButton(self.settings_frame, text="Apply Settings", command=self.apply_settings, width=150)
+        self.apply_btn.pack(padx=10)
+        # ----------------------
+
         self.start_btn = ctk.CTkButton(self.sidebar_frame, text="START BOT", command=self.start_bot, fg_color="green", hover_color="darkgreen")
-        self.start_btn.grid(row=1, column=0, padx=20, pady=10)
+        self.start_btn.grid(row=2, column=0, padx=20, pady=10)
 
         self.stop_btn = ctk.CTkButton(self.sidebar_frame, text="STOP BOT", command=self.stop_bot, fg_color="red", hover_color="darkred", state="disabled")
-        self.stop_btn.grid(row=2, column=0, padx=20, pady=10)
+        self.stop_btn.grid(row=3, column=0, padx=20, pady=10)
         
-        self.status_label = ctk.CTkLabel(self.sidebar_frame, text="Status: OFFLINE", text_color="gray")
-        self.status_label.grid(row=3, column=0, padx=20, pady=10)
+        self.status_label = ctk.CTkLabel(self.sidebar_frame, text="Status: OFFLINE", text_color="gray", font=ctk.CTkFont(weight="bold"))
+        self.status_label.grid(row=4, column=0, padx=20, pady=5)
+        
+        self.profit_label = ctk.CTkLabel(self.sidebar_frame, text="Profit: $0.00", text_color="cyan", font=ctk.CTkFont(size=16, weight="bold"))
+        self.profit_label.grid(row=5, column=0, padx=20, pady=(5, 20))
 
         # --- Main Content Area ---
         self.main_frame = ctk.CTkFrame(self)
@@ -108,6 +135,16 @@ class DerivBotApp(ctk.CTk):
         root_logger.addHandler(handler)
         self.log_handler = handler
 
+    def apply_settings(self):
+        try:
+            target = float(self.entry_profit.get())
+            cooldown = float(self.entry_cooldown.get())
+            self.bot_settings["profit_threshold"] = target
+            self.bot_settings["cooldown_minutes"] = cooldown
+            self.log_message(f"[Settings] Updated: Target={target}$, Cooldown={cooldown}m")
+        except ValueError:
+            self.log_message("[Error] Invalid settings values. Please enter numbers.")
+
     def log_message(self, msg):
         self.textbox.insert("end", msg + "\n")
         self.textbox.see("end")
@@ -128,7 +165,7 @@ class DerivBotApp(ctk.CTk):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(bot_main(self.ui_queue))
+            loop.run_until_complete(bot_main(self.ui_queue, self.bot_settings))
         except Exception as e:
             self.ui_queue.put({"type": "log", "message": f"Bot crashed: {e}"})
         finally:
@@ -151,6 +188,14 @@ class DerivBotApp(ctk.CTk):
                     self.log_message(msg["message"])
                 elif msg["type"] == "metrics":
                     self.update_metrics(msg)
+                elif msg["type"] == "profit_update":
+                    profit = msg["profit"]
+                    color = "green" if profit >= 0 else "red"
+                    self.profit_label.configure(text=f"Profit: ${profit:.2f}", text_color=color)
+                elif msg["type"] == "status_update":
+                    # For Cooldown state
+                    status = msg["status"]
+                    self.status_label.configure(text=f"Status: {status}", text_color="orange")
                 elif msg["type"] == "bot_stopped":
                     self.stop_bot()
         except queue.Empty:

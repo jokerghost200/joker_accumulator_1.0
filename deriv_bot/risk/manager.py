@@ -40,10 +40,11 @@ class RiskManager:
             self.is_trading_blocked = True
             return False
             
-        if self.daily_profit >= self.daily_profit_target:
-            logger.info("Daily profit target reached. Trading blocked for today.")
-            self.is_trading_blocked = True
-            return False
+        # We disable the hard stop for daily_profit target as it is now handled by the Cooldown system in main.py
+        # if self.daily_profit >= self.daily_profit_target:
+        #     logger.info("Daily profit target reached. Trading blocked for today.")
+        #     self.is_trading_blocked = True
+        #     return False
             
         if self.consecutive_losses >= self.max_consecutive_losses:
             logger.warning(f"Max consecutive losses ({self.max_consecutive_losses}) reached. Trading blocked.")

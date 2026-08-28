@@ -18,7 +18,7 @@ from data.cache import MarketDataCache
 from risk.manager import RiskManager
 from utils.logger import setup_logger
 
-async def main(ui_queue=None):
+async def main(ui_queue=None, bot_settings=None):
     # 1. Setup Environment and Logger
     load_dotenv()
     logger = setup_logger()
@@ -66,11 +66,17 @@ async def main(ui_queue=None):
     dynamic_ml_threshold = 0.50
     latest_row_data = None
     
+    if bot_settings is None:
+        bot_settings = {"profit_threshold": 5.0, "cooldown_minutes": 60.0}
+        
+    session_profit = 0.0
+    is_in_cooldown = False
+    
     # 4. Define the Trading Loop Callback for Ticks
     async def process_new_tick(df):
-        nonlocal is_trading, last_eval_time, latest_bbu, latest_bbl, latest_bbm, dynamic_ml_threshold, latest_row_data
+        nonlocal is_trading, last_eval_time, latest_bbu, latest_bbl, latest_bbm, dynamic_ml_threshold, latest_row_data, is_in_cooldown, session_profit
         
-        if is_trading:
+        if is_trading or is_in_cooldown:
             return
             
         # Limit evaluations slightly to avoid overloading the CPU, e.g. every 2 seconds max
@@ -208,6 +214,8 @@ Probabilité danger: {prob_danger:.2%}
                 nonlocal is_trading
                 nonlocal dynamic_ml_threshold
                 nonlocal contract_settled
+                nonlocal session_profit
+                nonlocal is_in_cooldown
                 
                 is_sold = poc.get('is_sold')
                 is_expired = poc.get('is_expired')
@@ -264,6 +272,33 @@ Probabilité danger: {prob_danger:.2%}
                     
                     try:
                         risk_manager.update_post_trade(float(profit), tick_count)
+                        session_profit += float(profit)
+                        
+                        if ui_queue:
+                            ui_queue.put({"type": "profit_update", "profit": session_profit})
+                            
+                        # Cooldown check
+                        target = float(bot_settings.get("profit_threshold", 5.0))
+                        if session_profit >= target:
+                            cooldown_mins = float(bot_settings.get("cooldown_minutes", 60.0))
+                            logger.warning(f"🎯 Objectif de profit atteint (${session_profit:.2f} >= ${target:.2f}). Pause (Cooldown) pendant {cooldown_mins} minutes.")
+                            if ui_queue:
+                                ui_queue.put({"type": "status_update", "status": f"COOLDOWN ({cooldown_mins}m)"})
+                            
+                            is_in_cooldown = True
+                            
+                            async def wait_cooldown():
+                                nonlocal session_profit, is_in_cooldown
+                                await asyncio.sleep(cooldown_mins * 60)
+                                session_profit = 0.0
+                                is_in_cooldown = False
+                                logger.info("✅ Cooldown terminé ! Reprise du trading. Profit de session réinitialisé à 0.")
+                                if ui_queue:
+                                    ui_queue.put({"type": "profit_update", "profit": session_profit})
+                                    ui_queue.put({"type": "status_update", "status": "RUNNING"})
+
+                            asyncio.create_task(wait_cooldown())
+                            
                     except (ValueError, TypeError):
                         pass
                     is_trading = False
