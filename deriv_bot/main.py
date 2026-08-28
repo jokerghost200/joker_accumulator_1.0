@@ -195,8 +195,9 @@ Signal détecté : OUI
                 ask_price = prop.get('ask_price')
                 
                 # Extract barrier
-                limit_order = prop.get('limit_order', {})
-                barrier_percentage = float(limit_order.get('tick_size_barrier_percentage', 0))
+                contract_details = prop.get('contract_details', {})
+                barrier_str = contract_details.get('tick_size_barrier_percentage', '0')
+                barrier_percentage = float(barrier_str.replace('%', '')) / 100.0 if isinstance(barrier_str, str) else float(barrier_str)
                 
                 if barrier_percentage == 0:
                     log_msg += f"Growth {int(rate*100)}%: ERREUR (Barrière manquante)\n"
