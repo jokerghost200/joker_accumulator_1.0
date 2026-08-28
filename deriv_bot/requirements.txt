@@ -1,0 +1,8 @@
+websockets
+requests
+pandas
+numpy
+scikit-learn
+joblib
+SQLAlchemy
+python-dotenv
