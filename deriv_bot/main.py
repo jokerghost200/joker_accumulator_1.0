@@ -134,12 +134,40 @@ async def main(ui_queue=None, bot_settings=None):
         
         signal_detected = is_near_mid and is_favorable_momentum and is_favorable_volatility and is_not_in_danger
         
-        # 4. AI Filter Confirmation
-        prob_safe, prob_danger = ml_filter.predict_probability(enriched)
-        is_ai_favorable = prob_danger < dynamic_ml_threshold
-        
-        # Formatter le log détaillé
-        log_msg = f"""
+        # 4. Fetch Proposals and AI Filter Confirmation
+        if signal_detected:
+            # We want to check all rates if Auto, or just one if specific
+            growth_rate_setting = bot_settings.get('growth_rate_str', 'Auto')
+            if growth_rate_setting == 'Auto':
+                growth_rates_to_test = [0.01, 0.02, 0.03, 0.04, 0.05]
+            else:
+                growth_rates_to_test = [float(growth_rate_setting.replace('%','')) / 100.0]
+            
+            logger.info("Signal detecté! Récupération des propositions pour analyser la probabilité de survie...")
+            
+            best_rate = None
+            best_prob = 0.0
+            best_contract_id = None
+            best_ask_price = None
+            best_tp_amount = None
+            
+            # Request all proposals in parallel
+            tp_amount = stake * (TAKE_PROFIT_PERCENT / 100.0)
+            
+            tasks = []
+            for rate in growth_rates_to_test:
+                tasks.append(execution.get_proposal(
+                    symbol=SYMBOL, 
+                    contract_type="ACCU", 
+                    stake=stake, 
+                    growth_rate=rate,
+                    limit_order={"take_profit": tp_amount}
+                ))
+            
+            import asyncio
+            proposals = await asyncio.gather(*tasks)
+            
+            log_msg = f"""
 [TICK]
 Prix: {close_price:.4f}
 BB Middle: {latest_bbm:.4f}
@@ -151,63 +179,76 @@ Volatilité: {tick_volatility:.4f}
 État du Squeeze: {"Près du centre" if is_near_mid else "Loin du centre"}
 
 [STRATEGY]
-Signal détecté : {"OUI" if signal_detected else "NON"}
+Signal détecté : OUI
 
-[AI]
-Probabilité favorable: {prob_safe:.2%}
-Probabilité danger: {prob_danger:.2%}
-
-[DECISION]
+[AI ACCUMULATOR PROBABILITIES]
 """
-        # Envoyer les metrics à l'interface
-        if ui_queue:
-            ui_queue.put({
-                "type": "metrics",
-                "price": close_price,
-                "bb_mid": latest_bbm,
-                "dist": dist_bb_mid,
-                "volatility": tick_volatility,
-                "momentum": tick_momentum,
-                "rsi": float(latest_row.get('tick_rsi_14', 0)),
-                "squeeze": "Près du centre" if is_near_mid else "Loin du centre",
-                "signal": signal_detected,
-                "prob_safe": prob_safe,
-                "prob_danger": prob_danger
-            })
+            
+            # Now we use the new ML engine for predictions
+            for rate, prop_resp in zip(growth_rates_to_test, proposals):
+                if 'error' in prop_resp:
+                    log_msg += f"Growth {int(rate*100)}%: ERREUR ({prop_resp['error'].get('message')})\n"
+                    continue
+                
+                prop = prop_resp.get('proposal', {})
+                contract_id = prop.get('id')
+                ask_price = prop.get('ask_price')
+                
+                # Extract barrier
+                limit_order = prop.get('limit_order', {})
+                barrier_percentage = float(limit_order.get('tick_size_barrier_percentage', 0))
+                
+                if barrier_percentage == 0:
+                    log_msg += f"Growth {int(rate*100)}%: ERREUR (Barrière manquante)\n"
+                    continue
+                
+                # Calculate target ticks based on the target profit formula
+                import math
+                target_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + rate))
+                
+                # Request survival probability from ML engine
+                prob_survive = ml_filter.predict_survival(enriched, target_ticks, barrier_percentage)
+                
+                decision = "BUY" if prob_survive > dynamic_ml_threshold else "WARN"
+                log_msg += f"Growth {int(rate*100)}% -> {prob_survive:.2%} ({decision}) [Ticks:{target_ticks}, Barrière:{barrier_percentage}%]\n"
+                
+                # Update best rate logic
+                if prob_survive > dynamic_ml_threshold and prob_survive > best_prob:
+                    best_prob = prob_survive
+                    best_rate = rate
+                    best_contract_id = contract_id
+                    best_ask_price = ask_price
+                    best_tp_amount = tp_amount
+            
+            log_msg += "\n[DECISION]\n"
+            
+            # Envoyer les metrics à l'interface
+            if ui_queue:
+                ui_queue.put({
+                    "type": "metrics",
+                    "price": close_price,
+                    "bb_mid": latest_bbm,
+                    "dist": dist_bb_mid,
+                    "volatility": tick_volatility,
+                    "momentum": tick_momentum,
+                    "rsi": float(latest_row.get('tick_rsi_14', 0)),
+                    "squeeze": "Près du centre" if is_near_mid else "Loin du centre",
+                    "signal": signal_detected,
+                    "prob_safe": best_prob,
+                    "prob_danger": 1.0 - best_prob
+                })
 
-        
-        if signal_detected and is_ai_favorable:
-            logger.info(log_msg + "BUY\n")
-            
-            expected_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + current_growth_rate))
-            logger.info(f"ACCUMULATOR Squeeze + ML SAFE! Entering trade.")
-            logger.info(f"Estimated duration to hit {TAKE_PROFIT_PERCENT}% TP: ~{expected_ticks} ticks")
-            
-            tp_amount = stake * (TAKE_PROFIT_PERCENT / 100.0)
-            proposal_response = await execution.get_proposal(
-                symbol=SYMBOL, 
-                contract_type="ACCU", 
-                stake=stake, 
-                growth_rate=current_growth_rate,
-                limit_order={"take_profit": tp_amount} # Native TP
-            )
-            
-            if 'error' in proposal_response:
-                logger.error(f"Proposal error: {proposal_response['error'].get('message')}")
+            if best_contract_id:
+                log_msg += f"Le bot choisit: {int(best_rate*100)}% offre le meilleur compromis avec une survie estimée de {best_prob:.2%}.\n"
+                logger.info(log_msg)
+                logger.info(f"*** EXECUTING ACCUMULATOR TRADE on {SYMBOL} for {stake} USD (TP: {best_tp_amount}$) ***")
+                result = await execution.buy_contract(best_contract_id, best_ask_price)
+            else:
+                log_msg += "HOLD (Aucun taux ne dépasse le seuil de sécurité de l'IA)\n"
+                logger.info(log_msg)
                 return
-                
-            proposal = proposal_response.get('proposal', {})
-            contract_id = proposal.get('id')
-            ask_price = proposal.get('ask_price')
-            
-            if not contract_id or not ask_price:
-                logger.error("Failed to get valid proposal for ACCUMULATOR.")
-                return
-                
-            logger.info(f"*** EXECUTING ACCUMULATOR TRADE on {SYMBOL} for {stake} USD (TP: {tp_amount}$) ***")
-            result = await execution.buy_contract(contract_id, ask_price)
         else:
-            logger.info(log_msg + "HOLD\n")
+            # Not a signal, just log HOLD occasionally or quietly skip
             return # Wait for the perfect entry conditions
                 
         if result:

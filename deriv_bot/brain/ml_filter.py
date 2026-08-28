@@ -30,124 +30,152 @@ class MLFilter:
         """
         Extracts relevant features for the ML model from the enriched DataFrame.
         """
-        # Select the columns that the model will use for prediction
-        # (Must match the columns used during training)
         features = [
             'ema_9', 'ema_20', 'ema_50', 'tick_rsi_14', 
             'macd', 'macd_signal', 'macd_hist',
             'bb_upper', 'bb_mid', 'bb_lower', 'bb_width',
             'dist_bb_mid', 'dist_bb_upper', 'dist_bb_lower',
             'tick_volatility_14', 'volatility_variation',
-            'roc_5', 'roc_10', 'price_change_1'
+            'roc_5', 'roc_10', 'price_change_1',
+            'instant_volatility', 'up_freq_10', 'up_freq_20',
+            'avg_move_10', 'avg_move_20',
+            'target_ticks', 'barrier_threshold'
         ]
         
-        # Only return existing features and drop NaNs
         available_features = [f for f in features if f in data.columns]
-        return data[available_features].fillna(0) # In production, handle NaNs properly
+        return data[available_features].fillna(0)
 
-    def predict_probability(self, current_data: pd.DataFrame) -> Tuple[float, float]:
+    def predict_survival(self, current_data: pd.DataFrame, target_ticks: int, barrier_threshold: float) -> float:
         """
-        Returns the probability of (SAFE, DANGER).
-        If model is not trained, returns (0.5, 0.5) to neutralize the filter.
+        Returns the probability of SURVIVAL.
         """
         if not self.is_trained or self.model is None:
-            return 0.5, 0.5
+            return 0.5
             
         try:
-            X = self.prepare_features(current_data.iloc[[-1]])
+            df = current_data.iloc[[-1]].copy()
+            df['target_ticks'] = target_ticks
+            df['barrier_threshold'] = barrier_threshold
             
-            # predict_proba returns [[prob_0, prob_1]]
-            # 0 is SAFE, 1 is DANGER
+            X = self.prepare_features(df)
+            
             probs = self.model.predict_proba(X)[0]
             
             if len(probs) == 2:
-                prob_safe, prob_danger = probs[0], probs[1]
-                return prob_safe, prob_danger
+                # Find the index for class '1' (Survival)
+                if 1 in self.model.classes_:
+                    idx = list(self.model.classes_).index(1)
+                    return probs[idx]
+                else:
+                    return 0.0
             else:
                 logger.warning(f"Unexpected predict_proba output shape: {probs}")
-                return 0.5, 0.5
+                return 0.5
                 
         except Exception as e:
             logger.error(f"ML prediction error: {e}")
-            return 0.5, 0.5
+            return 0.5
             
-    def train(self, historical_data: pd.DataFrame, target_duration: int = 10):
+    def train(self, historical_data: pd.DataFrame):
         """
-        Trains the model on historical data.
-        Target is 1 (DANGER) if the price touches the CURRENT Bollinger bands 
-        within the next `target_duration` ticks.
-        Target is 0 (SAFE) otherwise.
+        Trains the model on historical data using dynamic Accumulator scenarios.
         """
-        logger.info("Starting ML model training for Accumulator on Ticks...")
+        logger.info("Starting ML model training for Accumulator Probability Engine...")
         
-        # Create target variable
         df = historical_data.copy()
-        
-        # Calculate future max and min close over the next N ticks
-        # rolling(window) looks backward, so we shift it backwards by target_duration
-        df['future_max_close'] = df['close'].rolling(window=target_duration, min_periods=1).max().shift(-target_duration)
-        df['future_min_close'] = df['close'].rolling(window=target_duration, min_periods=1).min().shift(-target_duration)
-        
-        # 1 = DANGER (Touches or breaks current Bollinger Bands within N ticks), 0 = SAFE
-        # To be safe, we add a slight margin of 85% to be realistic about "reaching" the bands
-        # (bb_upper - bb_mid) * 0.85
-        margin_upper = df['bb_mid'] + (df['bb_upper'] - df['bb_mid']) * 0.85
-        margin_lower = df['bb_mid'] - (df['bb_mid'] - df['bb_lower']) * 0.85
-        
-        danger_condition = (df['future_max_close'] >= margin_upper) | (df['future_min_close'] <= margin_lower)
-        df['target'] = danger_condition.astype(int)
-        
-        # Drop rows where we don't have future data or have NaNs in indicators
         df = df.dropna()
         
-        X = self.prepare_features(df)
-        y = df['target']
-        
-        if len(X) < 100:
+        if len(df) < 500:
             logger.warning("Not enough data to train ML model.")
             return
             
-        # Train a simple Random Forest
-        self.model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+        # To simulate multiple scenarios, we will duplicate the dataset and assign random barriers & targets
+        scenarios = []
+        import random
+        
+        logger.info("Generating survival scenarios for training...")
+        
+        # Precompute the absolute pct change for efficiency
+        df['abs_pct_change'] = df['close'].pct_change().abs()
+        
+        # We will create 3 scenarios per historical row
+        for i in range(3):
+            scenario_df = df.copy()
+            
+            # Random target ticks between 5 and 50
+            scenario_df['target_ticks'] = np.random.randint(5, 50, size=len(scenario_df))
+            
+            # Random barrier threshold between 0.003% and 0.01%
+            scenario_df['barrier_threshold'] = np.random.uniform(0.00003, 0.00010, size=len(scenario_df))
+            
+            scenarios.append(scenario_df)
+            
+        training_df = pd.concat(scenarios, ignore_index=True)
+        
+        # Now, calculate the target: Did it survive?
+        # A contract survives if the MAX abs_pct_change in the NEXT 'target_ticks' is < 'barrier_threshold'
+        # Because target_ticks varies per row, we can't use a simple rolling.
+        # This is slow in pandas, so we'll use numpy arrays for speed
+        
+        closes = df['close'].values
+        abs_pct = df['abs_pct_change'].values
+        
+        # We need the original index to map back to the timeline
+        # Since training_df is concatenated, its index is 0 to 3*len-1
+        # The true 'time' index within `abs_pct` is just `i % len(df)`
+        n_orig = len(df)
+        
+        targets = np.zeros(len(training_df))
+        
+        target_ticks_arr = training_df['target_ticks'].values
+        barrier_arr = training_df['barrier_threshold'].values
+        
+        logger.info(f"Computing survival for {len(training_df)} scenarios...")
+        
+        for i in range(len(training_df)):
+            orig_idx = i % n_orig
+            tt = target_ticks_arr[i]
+            barrier = barrier_arr[i]
+            
+            # Check future ticks: from orig_idx + 1 to orig_idx + tt
+            end_idx = min(orig_idx + 1 + tt, n_orig)
+            
+            if end_idx == n_orig:
+                # Not enough future data to know if it survived
+                targets[i] = np.nan
+                continue
+                
+            future_pct_changes = abs_pct[orig_idx + 1 : end_idx]
+            max_change = np.max(future_pct_changes)
+            
+            if max_change > barrier:
+                targets[i] = 0 # Knockout
+            else:
+                targets[i] = 1 # Survived
+                
+        training_df['target'] = targets
+        training_df = training_df.dropna(subset=['target'])
+        
+        X = self.prepare_features(training_df)
+        y = training_df['target'].astype(int)
+        
+        logger.info(f"Training Random Forest on {len(X)} samples...")
+        self.model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1)
         self.model.fit(X, y)
         self.is_trained = True
         
-        # Ensure directory exists
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         joblib.dump(self.model, self.model_path)
         
-        # Basic accuracy log
+        # Accuracy metrics
         y_pred = self.model.predict(X)
+        accuracy = self.model.score(X, y)
+        survival_rate = y.mean()
         
-        # Calculate metrics
-        from sklearn.metrics import confusion_matrix
+        logger.info(f"--- ML MODEL TRAINING RESULTS ---")
+        logger.info(f"Overall Accuracy: {accuracy:.2%}")
+        logger.info(f"Dataset Baseline Survival Rate: {survival_rate:.2%}")
         
-        cm = confusion_matrix(y, y_pred)
-        if cm.shape == (2, 2):
-            tn, fp, fn, tp = cm.ravel()
-            
-            total_samples = len(y)
-            # Signal means the model predicted SAFE (0)
-            total_signals = tn + fn # Actual safe predicted safe (TN) + Actual danger predicted safe (FN)
-            signal_rate = total_signals / total_samples
-            
-            # False Positive in trading terms: Predicted SAFE (0) but actually DANGER (1) -> this is FN in sklearn terms since target 1 is Positive
-            # Let's define them explicitly based on trading logic:
-            # Positive for model is DANGER (1).
-            # Model predicts 0 (SAFE) -> Bot enters trade.
-            # If Actual is 1 (DANGER), and Model predicted 0 (SAFE) -> False Safe (Trading False Positive)
-            false_safe = fn
-            false_safe_rate = false_safe / total_signals if total_signals > 0 else 0
-            
-            # Model predicts 1 (DANGER) -> Bot skips trade.
-            # If Actual is 0 (SAFE), and Model predicted 1 (DANGER) -> Missed Opportunity
-            missed_opp = fp
-            missed_opp_rate = missed_opp / (tn + fp) if (tn + fp) > 0 else 0
-            
-            logger.info("--- TRADING METRICS ---")
-            logger.info(f"Signal Rate (Trades taken): {signal_rate:.2%} ({total_signals}/{total_samples})")
-            logger.info(f"False Positives (Dangerous trades taken): {false_safe_rate:.2%} ({false_safe}/{total_signals})")
-            logger.info(f"Missed Opportunities (Safe trades skipped): {missed_opp_rate:.2%} ({missed_opp}/{(tn + fp)})")
-        else:
-            accuracy = self.model.score(X, y)
-            logger.info(f"ML Model trained successfully. In-sample accuracy: {accuracy:.2%}")
+        from sklearn.metrics import classification_report
+        report = classification_report(y, y_pred, target_names=["Knockout", "Survive"])
+        logger.info(f"Classification Report:\n{report}")

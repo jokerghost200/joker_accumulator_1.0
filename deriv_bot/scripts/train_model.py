@@ -37,10 +37,9 @@ async def main():
         return
         
     await ws.connect()
-    
-    # We want a lot of data to train the model, say 5000 candles
-    symbol = "R_100"
-    count = 5000
+    # We want a lot of data to train the model, say 10000 candles
+    symbol = "R_10"
+    count = 10000
     
     logger.info(f"Fetching {count} historical ticks for {symbol}...")
     
@@ -84,8 +83,7 @@ async def main():
     ml_filter = MLFilter(model_path=model_path)
     
     logger.info("Training ML model...")
-    # target_duration = 5 ticks ahead. Accumulators tick once per second roughly.
-    ml_filter.train(enriched_df, target_duration=5)
+    ml_filter.train(enriched_df)
     
     await ws.disconnect()
     logger.info("Training complete!")

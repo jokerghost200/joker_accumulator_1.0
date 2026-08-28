@@ -56,4 +56,18 @@ class FeatureEngine:
         data['roc_10'] = data['close'].pct_change(periods=10) * 100
         data['price_change_1'] = data['close'].diff(1)
         
+        # 8. Accumulator Specific Features
+        # Instantaneous absolute percentage change
+        abs_pct = returns.abs()
+        data['instant_volatility'] = abs_pct
+        
+        # Frequency of UP/DOWN movements
+        is_up = (data['close'].diff(1) > 0).astype(int)
+        data['up_freq_10'] = is_up.rolling(10).sum() / 10
+        data['up_freq_20'] = is_up.rolling(20).sum() / 20
+        
+        # Average movement size
+        data['avg_move_10'] = abs_pct.rolling(10).mean()
+        data['avg_move_20'] = abs_pct.rolling(20).mean()
+        
         return data

@@ -61,8 +61,11 @@ class DerivBotApp(ctk.CTk):
         self.entry_stake.pack(padx=10, pady=(0, 5))
         
         ctk.CTkLabel(self.settings_frame, text="Taux de Croissance:").pack(anchor="w", padx=10)
-        self.combo_growth = ctk.CTkComboBox(self.settings_frame, values=["1%", "2%", "3%", "4%", "5%"], width=150)
-        self.combo_growth.set(f"{int(self.bot_settings['growth_rate']*100)}%")
+        
+        # We store the initial value as a string (e.g. "Auto" or "5%")
+        initial_growth = self.bot_settings.get("growth_rate_str", "Auto")
+        self.combo_growth = ctk.CTkComboBox(self.settings_frame, values=["Auto", "1%", "2%", "3%", "4%", "5%"], width=150)
+        self.combo_growth.set(initial_growth)
         self.combo_growth.pack(padx=10, pady=(0, 5))
         
         ctk.CTkLabel(self.settings_frame, text="Profit Target ($):").pack(anchor="w", padx=10)
@@ -152,15 +155,18 @@ class DerivBotApp(ctk.CTk):
             target = float(self.entry_profit.get())
             cooldown = float(self.entry_cooldown.get())
             stake = float(self.entry_stake.get())
-            growth_str = self.combo_growth.get().replace("%", "")
-            growth = float(growth_str) / 100.0
+            growth_str = self.combo_growth.get()
+            self.bot_settings['growth_rate_str'] = growth_str
+            if growth_str == "Auto":
+                self.bot_settings['growth_rate'] = "Auto"
+            else:
+                self.bot_settings['growth_rate'] = float(growth_str.replace('%', '')) / 100.0
             
             self.bot_settings["profit_threshold"] = target
             self.bot_settings["cooldown_minutes"] = cooldown
             self.bot_settings["initial_stake"] = stake
-            self.bot_settings["growth_rate"] = growth
             
-            self.log_message(f"[Settings] Updated: Stake={stake}$, Growth={growth*100}%, Target={target}$, Cooldown={cooldown}m")
+            self.log_message(f"[Settings] Updated: Stake={stake}$, Growth={growth_str}, Target={target}$, Cooldown={cooldown}m")
         except ValueError:
             self.log_message("[Error] Invalid settings values. Please enter numbers.")
 
