@@ -58,6 +58,24 @@ async def main(ui_queue=None, bot_settings=None):
         
     is_trading = False
     
+    async def background_retrain():
+        try:
+            logger.info("Extracting live history for background retraining...")
+            df = cache.get_dataframe()
+            if df.empty or len(df) < 500:
+                logger.warning("Not enough data to retrain on the fly.")
+                return
+            enriched = feature_engine.enrich_data(df)
+            
+            def run_training():
+                ml_filter.train(enriched)
+                ml_filter.save_model()
+                
+            await asyncio.to_thread(run_training)
+            logger.info("✅ Ré-entraînement terminé avec succès ! Le bot a appris de son erreur.")
+        except Exception as e:
+            logger.error(f"Erreur lors du ré-entraînement en tâche de fond: {e}")
+            
     import time
     last_eval_time = 0
     
@@ -65,7 +83,7 @@ async def main(ui_queue=None, bot_settings=None):
     latest_bbl = None
     latest_bbm = None
     
-    dynamic_ml_threshold = 0.50
+    dynamic_ml_threshold = 0.80
     latest_row_data = None
     
     if bot_settings is None:
@@ -73,6 +91,7 @@ async def main(ui_queue=None, bot_settings=None):
             "profit_threshold": 5.0, 
             "cooldown_minutes": 60.0,
             "initial_stake": 5.0,
+            "max_loss": 20.0,
             "growth_rate": 0.05
         }
         
@@ -144,7 +163,13 @@ async def main(ui_queue=None, bot_settings=None):
                 best_local_rate = rate
                 
         signal_detected = False
-        if best_local_prob > dynamic_ml_threshold:
+        
+        # Apply Prudence Mode if profit is $3 or more
+        current_threshold = dynamic_ml_threshold
+        if session_profit >= 3.0:
+            current_threshold = max(0.85, dynamic_ml_threshold)
+            
+        if best_local_prob > current_threshold:
             signal_detected = True
         
         # 4. Fetch Proposals and AI Filter Confirmation
@@ -230,11 +255,11 @@ Signal détecté : OUI
                     rate=rate
                 )
                 
-                decision = "BUY" if prob_survive > dynamic_ml_threshold else "WARN"
+                decision = "BUY" if prob_survive > current_threshold else "WARN"
                 log_msg += f"Growth {int(rate*100)}% -> {prob_survive:.2%} ({decision}) [Ticks:{target_ticks}, Barrière:{barrier_percentage}%]\n"
                 
                 # Update best rate logic
-                if prob_survive > dynamic_ml_threshold and prob_survive > best_prob:
+                if prob_survive > current_threshold and prob_survive > best_prob:
                     best_prob = prob_survive
                     best_rate = rate
                     best_contract_id = contract_id
@@ -333,12 +358,15 @@ Signal détecté : OUI
                             logger.info(f"[LOSS DIAGNOSTICS] Dist_BB={dist_bb:.4f}%, Tick_Mom={t_mom:.4f}, Tick_Vol={t_vol:.4f}")
                         
                         # Dynamic ML Threshold Update (Stricter)
-                        dynamic_ml_threshold = max(0.35, dynamic_ml_threshold - 0.05)
+                        dynamic_ml_threshold = min(0.90, dynamic_ml_threshold + 0.02)
                         logger.warning(f"[BOT LOST] Becoming more strict! New Danger Threshold: {dynamic_ml_threshold:.2%}")
+                        
+                        logger.info("Déclenchement du ré-entraînement de l'IA en tâche de fond...")
+                        asyncio.create_task(background_retrain())
                     
                     elif status == 'won':
                         # Regain confidence (Relax threshold slightly)
-                        dynamic_ml_threshold = min(0.55, dynamic_ml_threshold + 0.01)
+                        dynamic_ml_threshold = max(0.80, dynamic_ml_threshold - 0.01)
                         logger.info(f"[BOT WON] Regaining confidence. New Danger Threshold: {dynamic_ml_threshold:.2%}")
                     
                     try:
@@ -347,6 +375,15 @@ Signal détecté : OUI
                         
                         if ui_queue:
                             ui_queue.put({"type": "profit_update", "profit": session_profit})
+                            
+                        # Max Loss check
+                        max_loss = float(bot_settings.get("max_loss", 20.0))
+                        if session_profit <= -max_loss:
+                            logger.error(f"🛑 PERTE MAXIMALE ATTEINTE (${session_profit:.2f} <= -${max_loss:.2f}). ARRÊT D'URGENCE DU TRADING.")
+                            if ui_queue:
+                                ui_queue.put({"type": "status_update", "status": "MAX LOSS REACHED"})
+                            is_trading = False
+                            return
                             
                         # Cooldown check
                         target = float(bot_settings.get("profit_threshold", 5.0))

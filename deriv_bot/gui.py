@@ -40,7 +40,8 @@ class DerivBotApp(ctk.CTk):
             "profit_threshold": 5.0,
             "cooldown_minutes": 60.0,
             "initial_stake": 5.0,
-            "growth_rate": 0.05
+            "growth_rate": 0.05,
+            "max_loss": 20.0
         }
 
         # --- Sidebar Controls ---
@@ -76,7 +77,12 @@ class DerivBotApp(ctk.CTk):
         ctk.CTkLabel(self.settings_frame, text="Cooldown (mins):").pack(anchor="w", padx=10)
         self.entry_cooldown = ctk.CTkEntry(self.settings_frame, width=150)
         self.entry_cooldown.insert(0, str(self.bot_settings["cooldown_minutes"]))
-        self.entry_cooldown.pack(padx=10, pady=(0, 10))
+        self.entry_cooldown.pack(padx=10, pady=(0, 5))
+        
+        ctk.CTkLabel(self.settings_frame, text="Perte Max ($):").pack(anchor="w", padx=10)
+        self.entry_max_loss = ctk.CTkEntry(self.settings_frame, width=150)
+        self.entry_max_loss.insert(0, str(self.bot_settings["max_loss"]))
+        self.entry_max_loss.pack(padx=10, pady=(0, 10))
         
         self.apply_btn = ctk.CTkButton(self.settings_frame, text="Apply Settings", command=self.apply_settings, width=150)
         self.apply_btn.pack(padx=10)
@@ -165,8 +171,10 @@ class DerivBotApp(ctk.CTk):
             self.bot_settings["profit_threshold"] = target
             self.bot_settings["cooldown_minutes"] = cooldown
             self.bot_settings["initial_stake"] = stake
+            max_loss = float(self.entry_max_loss.get())
+            self.bot_settings["max_loss"] = max_loss
             
-            self.log_message(f"[Settings] Updated: Stake={stake}$, Growth={growth_str}, Target={target}$, Cooldown={cooldown}m")
+            self.log_message(f"[Settings] Updated: Stake={stake}$, Growth={growth_str}, Target={target}$, Cooldown={cooldown}m, MaxLoss={max_loss}$")
         except ValueError:
             self.log_message("[Error] Invalid settings values. Please enter numbers.")
 

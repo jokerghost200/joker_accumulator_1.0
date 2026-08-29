@@ -157,6 +157,21 @@ class MLFilter:
         training_df['target'] = targets
         training_df = training_df.dropna(subset=['target'])
         
+        # --- AUTO-LEARNING INTEGRATION ---
+        import os
+        live_csv_path = 'data/live_training.csv'
+        if os.path.exists(live_csv_path):
+            try:
+                live_df = pd.read_csv(live_csv_path)
+                if not live_df.empty and 'survived' in live_df.columns:
+                    logger.info(f"Integrate {len(live_df)} live training records from recent mistakes/wins!")
+                    live_df['target'] = live_df['survived']
+                    live_df = live_df.drop(columns=['survived'])
+                    training_df = pd.concat([training_df, live_df], ignore_index=True)
+            except Exception as e:
+                logger.error(f"Error loading live_training.csv: {e}")
+        # ---------------------------------
+        
         X = self.prepare_features(training_df)
         y = training_df['target'].astype(int)
         

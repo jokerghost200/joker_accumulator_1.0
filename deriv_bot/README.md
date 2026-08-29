@@ -12,9 +12,10 @@ Ce bot est conçu pour appliquer une stratégie **"Sniper sur Bandes de Bollinge
 - **Ultra-Réactivité (Ticks)** : Le bot fonctionne sur le flux de Ticks pour une réactivité à la fraction de seconde.
 - **Moteur IA Probabiliste Orienté Survie** : L'IA ne prédit plus simplement "HAUT" ou "BAS". Elle estime la **probabilité de survie** du contrat (ex: P(Survie 8 ticks) = 91%) en fonction du taux de croissance et des barrières (Knockout thresholds).
 - **Auto-Sélection du Taux de Croissance** : Si le paramètre `Auto` est sélectionné dans l'interface, le bot interrogera l'API pour les 5 taux (1% à 5%) et choisira intelligemment le taux offrant le meilleur compromis rendement/risque.
-- **Objectifs de Session (Cooldowns)** : Le bot peut être configuré pour faire une pause (ex: 60 minutes) après avoir atteint un certain profit (ex: 5$).
+- **Objectifs de Session (Cooldowns) & Perte Maximale (Max Loss)** : Le bot peut être configuré pour faire une pause après avoir atteint un certain profit (ex: 5$). Il inclut également un arrêt d'urgence configurable (Max Loss) pour protéger votre capital en cas de série de pertes (ex: arrêt si -20$).
 - **Filtres Anti-Bruit & Squeeze** : Refuse de trader tant que le prix n'est pas confiné au centre des bandes de Bollinger, et utilise des filtres de Volatilité et de Momentum.
-- **Auto-Amélioration (Dynamic Thresholding)** : Le bot adapte son niveau d'exigence en temps réel. S'il subit une perte, le seuil de sécurité IA requis augmente automatiquement.
+- **Auto-Amélioration (On-the-Fly Retraining)** : Dès que le bot subit une perte, il extrait les données de cette erreur, lance un ré-entraînement ultra-rapide en tâche de fond (sans vous déconnecter), et met à jour son modèle XGBoost instantanément pour ne plus refaire cette erreur.
+- **Gestion Dynamique du Risque (Prudence Mode)** : Le bot démarre avec une exigence de sécurité élevée (80%). S'il génère un profit satisfaisant (ex: > 3$), il passe en "Mode Prudence" (85%) pour sécuriser vos gains jusqu'à la fin de l'objectif. S'il subit une perte, il devient temporairement paranoïaque (90%) le temps de reprendre confiance.
 
 ---
 
@@ -76,14 +77,14 @@ python gui.py
 
 1. Configurez votre **Stake (Mise Initiale)**.
 2. Choisissez un **Taux de Croissance (1% à 5%)**, ou laissez sur **Auto** pour que l'IA choisisse le meilleur taux dynamiquement.
-3. Définissez vos objectifs de session (Profit Cible et temps de pause).
+3. Définissez vos objectifs de session : **Profit Target** (déclenche le temps de pause/cooldown) et **Perte Max** (déclenche l'arrêt d'urgence du bot).
 4. Cliquez sur **START BOT** pour lancer la connexion à Deriv.
 
 ---
 
 ## 🤖 Réentraîner l'Intelligence Artificielle
 
-Si vous souhaitez que l'IA s'adapte aux toutes dernières données du marché, vous pouvez relancer son entraînement à tout moment :
+Bien que le bot apprenne de ses erreurs "à la volée" (On-the-fly) pendant que vous tradez, vous pouvez également relancer son entraînement complet depuis zéro à tout moment (par exemple, au début d'une nouvelle journée) :
 ```bash
 python scripts/train_model.py
 ```
