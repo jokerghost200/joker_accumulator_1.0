@@ -24,22 +24,20 @@ logger = logging.getLogger(__name__)
 async def main():
     load_dotenv()
     
-    app_id = os.getenv("DERIV_APP_ID", "1089")
+    # We force a public app_id (1089 is Deriv's general public ID) because the one in .env is invalid (not numeric)
+    app_id = "1089"
     api_token = os.getenv("DERIV_PAT")
     
     ws = DerivWebSocket(app_id=app_id)
-    rest_api = DerivREST(app_id=app_id, pat=api_token)
-    auth = DerivAuthenticator(ws, rest_api, account_type="demo")
     
-    logger.info("Authenticating to get secure WebSocket URL...")
-    if not await auth.authenticate():
-        logger.error("Authentication failed. Cannot connect.")
-        return
-        
+    # We do not need authentication to fetch historical ticks
+    # This avoids REST API timeouts
+    logger.info("Connecting to public WebSocket URL...")
     await ws.connect()
-    # We want a lot of data to train the model, say 10000 candles
+    
+    # We want a lot of data to train the model, say 3000 candles (5000 sometimes times out on Deriv)
     symbol = "R_10"
-    count = 10000
+    count = 3000
     
     logger.info(f"Fetching {count} historical ticks for {symbol}...")
     
@@ -51,12 +49,12 @@ async def main():
         "style": "ticks"
     }
     
-    response = await ws.send_request(request)
+    response = await ws.send_request(request, timeout=30)
     
     if 'error' in response:
         logger.error(f"Failed to fetch historical data: {response['error'].get('message')}")
         await ws.disconnect()
-        return
+        sys.exit(1)
         
     history = response.get('history', {})
     prices = history.get('prices', [])
@@ -65,7 +63,7 @@ async def main():
     if not prices or not times:
         logger.error("No ticks received.")
         await ws.disconnect()
-        return
+        sys.exit(1)
         
     df = pd.DataFrame({
         'time': pd.to_datetime(times, unit='s'),

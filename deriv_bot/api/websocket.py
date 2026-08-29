@@ -18,22 +18,28 @@ class DerivWebSocket:
         self._req_id = 0
         self.pending_requests: Dict[int, asyncio.Future] = {}
 
-    async def connect(self):
-        """Connect to Deriv WebSocket API."""
-        try:
-            logger.info(f"Connecting to {self.endpoint}...")
-            # Disable protocol-level pings as Deriv might not respond to them properly
-            self.ws = await websockets.connect(self.endpoint, ping_interval=None)
-            self.connected = True
-            logger.info("Connected successfully to Deriv WebSocket API.")
-            
-            # Start a listener task and a keepalive task
-            self._loop = asyncio.create_task(self._listen_for_messages())
-            self._keepalive_task = asyncio.create_task(self._keep_alive())
-        except Exception as e:
-            logger.error(f"Failed to connect: {e}")
-            self.connected = False
-            raise e
+    async def connect(self, max_retries=3, retry_delay=5):
+        """Connect to Deriv WebSocket API with retries."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(f"Connecting to {self.endpoint} (Attempt {attempt}/{max_retries})...")
+                # Disable protocol-level pings as Deriv might not respond to them properly
+                self.ws = await websockets.connect(self.endpoint, ping_interval=None, open_timeout=30)
+                self.connected = True
+                logger.info("Connected successfully to Deriv WebSocket API.")
+                
+                # Start a listener task and a keepalive task
+                self._loop = asyncio.create_task(self._listen_for_messages())
+                self._keepalive_task = asyncio.create_task(self._keep_alive())
+                return
+            except Exception as e:
+                logger.error(f"Failed to connect: {e}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    self.connected = False
+                    raise e
 
     async def disconnect(self):
         """Disconnect from Deriv WebSocket API."""

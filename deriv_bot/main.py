@@ -11,6 +11,7 @@ from api.market_data import MarketDataSubscription
 from api.execution import ExecutionEngine
 from brain.feature_engine import FeatureEngine
 from brain.ml_filter import MLFilter
+from brain.auto_learning import AutoLearner
 
 from data.collector import DataEngine
 from data.cache import MarketDataCache
@@ -42,6 +43,7 @@ async def main(ui_queue=None, bot_settings=None):
     cache = MarketDataCache(max_size=5000)
     feature_engine = FeatureEngine()
     ml_filter = MLFilter()
+    auto_learner = AutoLearner()
     risk_manager = RiskManager(
         sizing_method="fixed", 
         fixed_stake=5.0, 
@@ -102,6 +104,14 @@ async def main(ui_queue=None, bot_settings=None):
         latest_row = enriched.iloc[-1]
         latest_row_data = latest_row
         close_price = float(latest_row['close'])
+        
+        # --- AUTO-LEARNING: Update Virtual Trades ---
+        new_outcomes = auto_learner.update_with_tick(close_price)
+        if auto_learner.collected_outcomes >= 100:
+            logger.info(f"Auto-Learning: 100 nouvelles expériences collectées. Déclenchement du ré-entraînement...")
+            ml_filter.retrain_live(auto_learner.csv_path)
+            auto_learner.reset_counter()
+        # --------------------------------------------
         latest_bbm = float(latest_row['bb_mid'])
         latest_bbu = float(latest_row['bb_upper'])
         latest_bbl = float(latest_row['bb_lower'])
@@ -109,30 +119,33 @@ async def main(ui_queue=None, bot_settings=None):
         tick_momentum = abs(float(latest_row['roc_10']))
         tick_volatility = float(latest_row['tick_volatility_14'])
         
-        # 4b. Strategy Engine (Entry Logic)
+        # 4b. Strategy Engine (Entry Logic - PURE AI)
         stake = float(bot_settings.get("initial_stake", 5.0))
-        current_growth_rate = float(bot_settings.get("growth_rate", 0.05))
         
-        # STRATEGY CONDITIONS:
-        absolute_bb_width = latest_bbu - latest_bbl
+        growth_rate_setting = bot_settings.get('growth_rate_str', 'Auto')
+        if growth_rate_setting == 'Auto':
+            growth_rates_to_test = [0.01, 0.02, 0.03, 0.04, 0.05]
+        else:
+            growth_rates_to_test = [float(growth_rate_setting.replace('%','')) / 100.0]
+            
+        # LOCAL AI PRE-FILTERING (No API calls yet!)
+        best_local_rate = None
+        best_local_prob = 0.0
         
-        # 1. Proximity to BB Middle: Must be within 20% of the BB Width from the middle
-        abs_dist_to_mid = abs(close_price - latest_bbm)
-        is_near_mid = abs_dist_to_mid < (absolute_bb_width * 0.20)
-        
-        # 2. Acceptable Momentum: Not a massive spike in the last 10 ticks
-        is_favorable_momentum = tick_momentum < 0.01
-        
-        # 3. Acceptable Volatility: Standard deviation of returns shouldn't be too wild
-        is_favorable_volatility = tick_volatility < 0.003
-        
-        # 4. Anti-Immediate Danger: Ensure price is not in the outer 15% bands
-        dist_to_upper = latest_bbu - close_price
-        dist_to_lower = close_price - latest_bbl
-        danger_threshold = absolute_bb_width * 0.15
-        is_not_in_danger = (dist_to_upper > danger_threshold) and (dist_to_lower > danger_threshold)
-        
-        signal_detected = is_near_mid and is_favorable_momentum and is_favorable_volatility and is_not_in_danger
+        for rate in growth_rates_to_test:
+            # Approximate the barrier like in backtest to save API limits
+            approx_barrier = 0.0005 - (rate * 0.001)
+            target_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + rate))
+            
+            # Predict using XGBoost
+            prob = ml_filter.predict_survival(enriched, target_ticks, approx_barrier)
+            if prob > best_local_prob:
+                best_local_prob = prob
+                best_local_rate = rate
+                
+        signal_detected = False
+        if best_local_prob > dynamic_ml_threshold:
+            signal_detected = True
         
         # 4. Fetch Proposals and AI Filter Confirmation
         if signal_detected:
@@ -164,7 +177,6 @@ async def main(ui_queue=None, bot_settings=None):
                     limit_order={"take_profit": tp_amount}
                 ))
             
-            import asyncio
             proposals = await asyncio.gather(*tasks)
             
             log_msg = f"""
@@ -176,7 +188,7 @@ BB Width: {float(latest_row['bb_width']):.4f}
 Momentum: {tick_momentum:.4f}
 RSI: {float(latest_row.get('tick_rsi_14', 0)):.2f}
 Volatilité: {tick_volatility:.4f}
-État du Squeeze: {"Près du centre" if is_near_mid else "Loin du centre"}
+État du Squeeze: Pure AI Mode
 
 [STRATEGY]
 Signal détecté : OUI
@@ -204,11 +216,19 @@ Signal détecté : OUI
                     continue
                 
                 # Calculate target ticks based on the target profit formula
-                import math
                 target_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + rate))
                 
                 # Request survival probability from ML engine
                 prob_survive = ml_filter.predict_survival(enriched, target_ticks, barrier_percentage)
+                
+                # Auto-Learning: Start tracking this simulated position
+                auto_learner.start_tracking(
+                    features=latest_row.to_dict(),
+                    start_price=close_price,
+                    target_ticks=target_ticks,
+                    barrier_pct=barrier_percentage,
+                    rate=rate
+                )
                 
                 decision = "BUY" if prob_survive > dynamic_ml_threshold else "WARN"
                 log_msg += f"Growth {int(rate*100)}% -> {prob_survive:.2%} ({decision}) [Ticks:{target_ticks}, Barrière:{barrier_percentage}%]\n"
@@ -233,10 +253,10 @@ Signal détecté : OUI
                     "volatility": tick_volatility,
                     "momentum": tick_momentum,
                     "rsi": float(latest_row.get('tick_rsi_14', 0)),
-                    "squeeze": "Près du centre" if is_near_mid else "Loin du centre",
+                    "squeeze": "Pure AI Mode",
                     "signal": signal_detected,
-                    "prob_safe": best_prob,
-                    "prob_danger": 1.0 - best_prob
+                    "prob_safe": best_local_prob,
+                    "prob_danger": 1.0 - best_local_prob
                 })
 
             if best_contract_id:
@@ -249,8 +269,22 @@ Signal détecté : OUI
                 logger.info(log_msg)
                 return
         else:
-            # Not a signal, just log HOLD occasionally or quietly skip
-            return # Wait for the perfect entry conditions
+            # Send metrics to UI even if no signal
+            if ui_queue:
+                ui_queue.put({
+                    "type": "metrics",
+                    "price": close_price,
+                    "bb_mid": latest_bbm,
+                    "dist": dist_bb_mid,
+                    "volatility": tick_volatility,
+                    "momentum": tick_momentum,
+                    "rsi": float(latest_row.get('tick_rsi_14', 0)),
+                    "squeeze": "Pure AI Mode",
+                    "signal": False,
+                    "prob_safe": best_local_prob,
+                    "prob_danger": 1.0 - best_local_prob
+                })
+            return # Wait for AI confidence
                 
         if result:
             contract_id = result.get('contract_id')
@@ -269,37 +303,26 @@ Signal détecté : OUI
                 is_expired = poc.get('is_expired')
                 status = poc.get('status')
                 profit = poc.get('profit')
-                tick_count = poc.get('tick_count')
+                # Accumulators return max ticks in 'tick_count'. Actual ticks are in 'tick_passed'
+                actual_ticks = poc.get('tick_passed', poc.get('tick_count', 0))
                 current_spot = poc.get('current_spot')
                 
-                # Exit Logic: Danger of Knockout (Close to BB)
-                if not is_sold and not is_expired and current_spot is not None and latest_bbu and latest_bbl:
-                    try:
-                        current_spot_float = float(current_spot)
-                        
-                        dist_to_upper = latest_bbu - current_spot_float
-                        dist_to_lower = current_spot_float - latest_bbl
-                        band_width = latest_bbu - latest_bbl
-                        
-                        # If price is within 15% of either band, SELL immediately
-                        threshold_dist = band_width * 0.15
-                        
-                        if dist_to_upper < threshold_dist or dist_to_lower < threshold_dist:
-                            logger.warning(f"[RESULT]\nDANGER (Price {current_spot_float} is too close to bands). Closing manually.")
-                            asyncio.create_task(execution.sell_contract(contract_id))
-                            return
-                    except (ValueError, TypeError):
-                        pass
+                # Exit Logic: Let it ride to TP or crash (Pure AI Mode)
+                # (Accumulators cannot be sold unless sell_price > stake anyway)
                 
                 if is_sold or is_expired or status in ['won', 'lost']:
                     if contract_settled:
                         return
                     contract_settled = True
                     
+                    # API sometimes sends intermediate 'open' status even when sold
+                    if status == 'open':
+                        status = 'won' if float(profit) > 0 else 'lost'
+                        
                     if status == 'won':
-                        logger.info(f"[RESULT]\nTP (Contract Settled WON, Profit: {profit}, Ticks: {tick_count})")
+                        logger.info(f"[RESULT]\nTP (Contract Settled WON, Profit: {profit}, Ticks: {actual_ticks})")
                     else:
-                        logger.info(f"[RESULT]\n{status.upper()} (Profit: {profit}, Ticks: {tick_count})")
+                        logger.info(f"[RESULT]\n{status.upper()} (Profit: {profit}, Ticks: {actual_ticks})")
                     
                     if status == 'lost':
                         # Diagnostics
@@ -319,7 +342,7 @@ Signal détecté : OUI
                         logger.info(f"[BOT WON] Regaining confidence. New Danger Threshold: {dynamic_ml_threshold:.2%}")
                     
                     try:
-                        risk_manager.update_post_trade(float(profit), tick_count)
+                        risk_manager.update_post_trade(float(profit), actual_ticks)
                         session_profit += float(profit)
                         
                         if ui_queue:

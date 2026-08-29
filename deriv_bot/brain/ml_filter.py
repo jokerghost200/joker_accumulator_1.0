@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 import joblib
 import os
 import logging
@@ -116,13 +116,11 @@ class MLFilter:
         # A contract survives if the MAX abs_pct_change in the NEXT 'target_ticks' is < 'barrier_threshold'
         # Because target_ticks varies per row, we can't use a simple rolling.
         # This is slow in pandas, so we'll use numpy arrays for speed
-        
         closes = df['close'].values
-        abs_pct = df['abs_pct_change'].values
         
         # We need the original index to map back to the timeline
         # Since training_df is concatenated, its index is 0 to 3*len-1
-        # The true 'time' index within `abs_pct` is just `i % len(df)`
+        # The true 'time' index within `closes` is just `i % len(df)`
         n_orig = len(df)
         
         targets = np.zeros(len(training_df))
@@ -145,11 +143,14 @@ class MLFilter:
                 targets[i] = np.nan
                 continue
                 
-            future_pct_changes = abs_pct[orig_idx + 1 : end_idx]
-            max_change = np.max(future_pct_changes)
+            entry_price = closes[orig_idx]
+            future_prices = closes[orig_idx + 1 : end_idx]
             
-            if max_change > barrier:
-                targets[i] = 0 # Knockout
+            # Max deviation from entry price as a percentage
+            max_deviation = np.max(np.abs(future_prices - entry_price) / entry_price)
+            
+            if max_deviation >= barrier:
+                targets[i] = 0 # Lost (hit barrier)
             else:
                 targets[i] = 1 # Survived
                 
@@ -159,8 +160,8 @@ class MLFilter:
         X = self.prepare_features(training_df)
         y = training_df['target'].astype(int)
         
-        logger.info(f"Training Random Forest on {len(X)} samples...")
-        self.model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42, n_jobs=-1)
+        logger.info(f"Training XGBoost on {len(X)} samples...")
+        self.model = XGBClassifier(n_estimators=150, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1, eval_metric='logloss')
         self.model.fit(X, y)
         self.is_trained = True
         
@@ -179,3 +180,49 @@ class MLFilter:
         from sklearn.metrics import classification_report
         report = classification_report(y, y_pred, target_names=["Knockout", "Survive"])
         logger.info(f"Classification Report:\n{report}")
+
+    def retrain_live(self, live_data_csv: str):
+        """
+        Retrains the model incorporating the live recorded data (Continuous Learning).
+        """
+        import threading
+        def _train_thread():
+            logger.info("Starting Auto-Learning (Continuous Learning) thread...")
+            try:
+                live_df = pd.read_csv(live_data_csv)
+                if len(live_df) < 50:
+                    logger.info("Not enough live data to retrain yet.")
+                    return
+                
+                # Limit to the most recent 10000 experiences to adapt to current market regime
+                live_df = live_df.tail(10000)
+                
+                X_live = self.prepare_features(live_df)
+                y_live = live_df['survived'].astype(int)
+                
+                # Check if we have both classes
+                if len(y_live.unique()) < 2:
+                    logger.warning("Live data contains only one class. Skipping retraining.")
+                    return
+                
+                logger.info(f"Retraining XGBoost with {len(X_live)} recent live experiences...")
+                
+                # Train a new model instance
+                new_model = XGBClassifier(n_estimators=150, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1, eval_metric='logloss')
+                new_model.fit(X_live, y_live)
+                
+                # Swap out the old model safely
+                self.model = new_model
+                
+                # Save the new model
+                os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+                joblib.dump(self.model, self.model_path)
+                
+                accuracy = self.model.score(X_live, y_live)
+                logger.info(f"[AI] Auto-apprentissage terminé. Nouvelle précision: {accuracy:.2%}")
+                
+            except Exception as e:
+                logger.error(f"Error during auto-learning: {e}")
+                
+        # Run training in a background thread to prevent freezing the bot
+        threading.Thread(target=_train_thread, daemon=True).start()
