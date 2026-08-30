@@ -39,6 +39,7 @@ class MLFilter:
             'roc_5', 'roc_10', 'price_change_1',
             'instant_volatility', 'up_freq_10', 'up_freq_20',
             'avg_move_10', 'avg_move_20',
+            'micro_volatility_5', 'adx_14', 'mean_reversion_ratio',
             'target_ticks', 'barrier_threshold'
         ]
         
@@ -161,8 +162,15 @@ class MLFilter:
         training_df['target'] = targets
         training_df = training_df.dropna(subset=['target'])
         
-        # --- AUTO-LEARNING INTEGRATION ---
+        # --- AUTO-LEARNING & MISTAKE WEIGHTING ---
         import os
+        from sklearn.calibration import CalibratedClassifierCV
+        
+        # 1. Time Decay weights for historical data (oldest = 0.1, newest = 1.0)
+        n_hist = len(training_df)
+        historical_weights = np.linspace(0.1, 1.0, n_hist)
+        training_df['weight'] = historical_weights
+        
         live_csv_path = 'data/live_training.csv'
         if os.path.exists(live_csv_path):
             try:
@@ -171,6 +179,10 @@ class MLFilter:
                     logger.info(f"Integrate {len(live_df)} live training records from recent mistakes/wins!")
                     live_df['target'] = live_df['survived']
                     live_df = live_df.drop(columns=['survived'])
+                    
+                    # 2. Mistake Weighting (x3 for losses, x1 for wins)
+                    live_df['weight'] = np.where(live_df['target'] == 0, 3.0, 1.0)
+                    
                     training_df = pd.concat([training_df, live_df], ignore_index=True)
             except Exception as e:
                 logger.error(f"Error loading live_training.csv: {e}")
@@ -178,9 +190,10 @@ class MLFilter:
         
         X = self.prepare_features(training_df)
         y = training_df['target'].astype(int)
+        weights = training_df['weight'].values
         
-        logger.info(f"Training XGBoost on {len(X)} samples...")
-        new_model = XGBClassifier(
+        logger.info(f"Training XGBoost on {len(X)} samples with Custom Weights...")
+        base_model = XGBClassifier(
             n_estimators=150, 
             max_depth=6, 
             learning_rate=0.1, 
@@ -188,8 +201,15 @@ class MLFilter:
             n_jobs=-1,
             eval_metric='logloss'
         )
-        new_model.fit(X, y)
-        self.model = new_model
+        # We don't fit base_model manually when using cv=3
+        # base_model.fit(X, y, sample_weight=weights)
+        
+        # 3. Probability Calibration (Pessimistic Smoothing)
+        logger.info("Applying CalibratedClassifierCV for pessimistic probabilities...")
+        calibrated_model = CalibratedClassifierCV(estimator=base_model, method='sigmoid', cv=3)
+        calibrated_model.fit(X, y, sample_weight=weights)
+        
+        self.model = calibrated_model
         self.is_trained = True
         
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)

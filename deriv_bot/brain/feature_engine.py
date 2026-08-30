@@ -5,6 +5,8 @@ from indicators.ema import calculate_ema
 from indicators.rsi import calculate_rsi
 from indicators.macd import calculate_macd
 from indicators.bollinger import calculate_bollinger_bands
+from indicators.adx import calculate_adx
+from indicators.atr import calculate_atr
 
 class FeatureEngine:
     """Calculates all necessary technical features from a raw Tick DataFrame."""
@@ -69,5 +71,21 @@ class FeatureEngine:
         # Average movement size
         data['avg_move_10'] = abs_pct.rolling(10).mean()
         data['avg_move_20'] = abs_pct.rolling(20).mean()
+        
+        # 9. New ML Enhancements (Pseudo-Candles)
+        # Create 5-tick rolling high/low for ADX and ATR
+        pseudo_high = data['close'].rolling(5).max()
+        pseudo_low = data['close'].rolling(5).min()
+        
+        # Micro-Volatility (5-tick std dev)
+        data['micro_volatility_5'] = returns.rolling(window=5).std() * 100
+        
+        # ADX (14 pseudo-candles)
+        data['adx_14'] = calculate_adx(pseudo_high, pseudo_low, data['close'], period=14)
+        
+        # Mean Reversion Ratio: (Distance to EMA20) / Tick Volatility
+        # Safe division
+        safe_vol = data['tick_volatility_14'].replace(0, 0.0001)
+        data['mean_reversion_ratio'] = ((data['close'] - data['ema_20']) / data['ema_20'] * 100) / safe_vol
         
         return data

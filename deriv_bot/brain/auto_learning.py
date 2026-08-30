@@ -4,6 +4,8 @@ import logging
 import uuid
 from typing import Dict, List, Any
 import threading
+from database.db_manager import StrategyDBManager
+from brain.pattern_recognizer import PatternRecognizer
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,7 @@ class AutoLearner:
         self.active_trades: List[VirtualTrade] = []
         self.collected_outcomes = 0
         self.lock = threading.Lock()
+        self.db = StrategyDBManager()
         
         # Ensure data directory exists
         os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
@@ -88,6 +91,14 @@ class AutoLearner:
         
         df = pd.DataFrame([data_row])
         
+        # Save to Golden Pattern DB
+        try:
+            pattern_hash = PatternRecognizer.get_pattern_hash(trade.features)
+            is_win = (outcome == 1)
+            self.db.record_outcome(pattern_hash, is_win)
+        except Exception as e:
+            logger.error(f"Failed to record golden pattern: {e}")
+
         # Determine if we should write headers
         write_header = not self._headers_written
         

@@ -18,12 +18,18 @@ from data.cache import MarketDataCache
 
 from risk.manager import RiskManager
 from utils.logger import setup_logger
+from utils.telegram_notifier import send_telegram_message, send_telegram_message_sync
+from database.db_manager import StrategyDBManager
+from brain.pattern_recognizer import PatternRecognizer
+
+db_manager = StrategyDBManager()
 
 async def main(ui_queue=None, bot_settings=None):
     # 1. Setup Environment and Logger
     load_dotenv()
     logger = setup_logger()
     logger.info("Starting Deriv Bot on TICKS...")
+    send_telegram_message_sync("🚀 <b>Deriv Bot Démarré</b>\nConnexion à l'API en cours...")
     app_id = os.getenv("DERIV_APP_ID", "1089")
     api_token = os.getenv("DERIV_PAT")
     account_type = os.getenv("DERIV_ACCOUNT_TYPE", "demo")
@@ -84,13 +90,18 @@ async def main(ui_queue=None, bot_settings=None):
             is_retraining = False
             
     import time
-    last_eval_time = 0
     
     latest_bbu = None
     latest_bbl = None
     latest_bbm = None
     
-    dynamic_ml_threshold = 0.80
+    # Global State variables
+    is_in_cooldown = False
+    consecutive_losses = 0
+    session_profit = 0.0
+    dynamic_ml_threshold = 0.55 # Starts at 55% now due to heavy ML penalty
+    last_eval_time = 0
+    last_trade_time = 0
     latest_row_data = None
     
     if bot_settings is None:
@@ -110,7 +121,7 @@ async def main(ui_queue=None, bot_settings=None):
     
     # 4. Define the Trading Loop Callback for Ticks
     async def process_new_tick(df):
-        nonlocal is_trading, last_eval_time, latest_bbu, latest_bbl, latest_bbm, dynamic_ml_threshold, latest_row_data, is_in_cooldown, session_profit, emergency_stop, current_balance, consecutive_losses
+        nonlocal is_trading, last_eval_time, last_trade_time, latest_bbu, latest_bbl, latest_bbm, dynamic_ml_threshold, latest_row_data, is_in_cooldown, session_profit, emergency_stop, current_balance, consecutive_losses
         
         if is_trading or is_in_cooldown or emergency_stop:
             return
@@ -120,6 +131,10 @@ async def main(ui_queue=None, bot_settings=None):
         if current_time - last_eval_time < 2:
             return
         last_eval_time = current_time
+        
+        # Mini-cooldown (60s) pour ne pas être trop pressé (patience)
+        if current_time - last_trade_time < 60:
+            return
             
         if not risk_manager.check_trade_allowed():
             return
@@ -129,6 +144,13 @@ async def main(ui_queue=None, bot_settings=None):
             
         # 4a. Features calculation on TICKS
         enriched = feature_engine.enrich_data(df)
+        
+        # --- INITIAL MODEL TRAINING CHECK ---
+        if not ml_filter.is_trained and not getattr(ml_filter, 'initial_training_started', False):
+            ml_filter.initial_training_started = True
+            logger.info("Modèle ML non entraîné au démarrage ! Déclenchement de l'entraînement initial sur l'historique...")
+            asyncio.create_task(background_retrain(df.copy()))
+        # ------------------------------------
         
         latest_row = enriched.iloc[-1]
         latest_row_data = latest_row
@@ -147,6 +169,19 @@ async def main(ui_queue=None, bot_settings=None):
         dist_bb_mid = abs(float(latest_row['dist_bb_mid'])) # % distance to middle
         tick_momentum = abs(float(latest_row['roc_10']))
         tick_volatility = float(latest_row['tick_volatility_14'])
+        
+        # --- GOLDEN PATTERN FAST-PATH ---
+        pattern_hash = PatternRecognizer.get_pattern_hash(latest_row)
+        pattern_stats = db_manager.get_pattern_stats(pattern_hash)
+        is_golden_pattern = False
+        if pattern_stats:
+            wins, losses, win_rate = pattern_stats
+            if wins >= 50 and win_rate >= 0.95:
+                is_golden_pattern = True
+                logger.info(f"🌟 GOLDEN PATTERN DÉTECTÉ 🌟 [{pattern_hash}] (Wins: {wins}, Rate: {win_rate:.1%})")
+                if ui_queue:
+                    ui_queue.put({"type": "status_update", "status": "🌟 GOLDEN PATTERN 🌟"})
+        # ---------------------------------
         
         # 4b. Strategy Engine (Entry Logic - PURE AI)
         stake = float(bot_settings.get("initial_stake", 5.0))
@@ -177,14 +212,22 @@ async def main(ui_queue=None, bot_settings=None):
         signal_detected = False
         
         # Apply Dynamic Prudence Mode
-        # RULE: Never go below 80% AI confidence minimum (Quality over Quantity)
-        dynamic_ml_threshold = max(0.80, dynamic_ml_threshold)
+        # Le seuil de base est à 52% (avantage statistique). 
+        # On plafonne à 62% pour ne pas bloquer le bot (sinon il ne trade jamais).
+        dynamic_ml_threshold = max(0.52, dynamic_ml_threshold)
         current_threshold = dynamic_ml_threshold
+        
+        # When in profit, increase prudence slowly to preserve capital (0.5% per 1$)
         if session_profit > 0:
-            prudence_bonus = session_profit * 0.015 # +1.5% for every $1 profit
-            current_threshold = min(0.95, dynamic_ml_threshold + prudence_bonus)
+            prudence_bonus = session_profit * 0.005 # +0.5% for every $1 profit
+            current_threshold = min(0.62, current_threshold + prudence_bonus)
             
-        if best_local_prob > current_threshold:
+        # When in loss (red), increase prudence slowly to avoid revenge trading (0.5% per 1$)
+        elif session_profit < 0:
+            prudence_bonus = abs(session_profit) * 0.005 # +0.5% for every $1 loss
+            current_threshold = min(0.62, current_threshold + prudence_bonus)
+            
+        if best_local_prob > current_threshold or is_golden_pattern:
             signal_detected = True
         
         # 4. Fetch Proposals and AI Filter Confirmation
@@ -290,6 +333,9 @@ Signal détecté : OUI
                 # Request survival probability from ML engine
                 prob_survive = ml_filter.predict_survival(enriched, target_ticks, barrier_percentage)
                 
+                if is_golden_pattern:
+                    prob_survive = 1.0  # Force to 100% to guarantee execution
+                
                 # Auto-Learning: Start tracking this simulated position
                 auto_learner.start_tracking(
                     features=latest_row.to_dict(),
@@ -300,6 +346,8 @@ Signal détecté : OUI
                 )
                 
                 status_str = "(BUY)" if prob_survive > current_threshold else "(WARN)"
+                if is_golden_pattern:
+                    status_str = "(GOLDEN BUY)"
                 log_msg += f"Growth {int(rate*100)}% -> {prob_survive:.2%} {status_str} [Ticks:{target_ticks}, Barrière:{barrier_percentage}%]\n"
                 
                 # Update best rate logic
@@ -341,6 +389,13 @@ Signal détecté : OUI
                 if not result:
                     # En cas d'erreur API lors de l'achat, on relâche le verrou
                     is_trading = False
+                else:
+                    asyncio.create_task(send_telegram_message(
+                        f"🟢 <b>TRADE OUVERT</b>\n"
+                        f"Mise: <b>{best_stake:.2f}$</b>\n"
+                        f"Objectif: <b>+{int(best_rate*100)}%</b>\n"
+                        f"Probabilité IA: <b>{best_prob:.1%}</b>"
+                    ))
             else:
                 log_msg += "HOLD (Aucun taux ne dépasse le seuil de sécurité de l'IA)\n"
                 logger.info(log_msg)
@@ -376,7 +431,7 @@ Signal détecté : OUI
             
             def on_contract_update(poc):
                 nonlocal is_trading, contract_settled, dynamic_ml_threshold, session_profit, is_in_cooldown, emergency_stop
-                nonlocal current_balance, consecutive_losses, sell_requested
+                nonlocal current_balance, consecutive_losses, sell_requested, last_trade_time
                 
                 is_sold = poc.get('is_sold')
                 is_expired = poc.get('is_expired')
@@ -414,8 +469,18 @@ Signal détecté : OUI
                         
                     if status == 'won':
                         logger.info(f"[RESULT]\nTP (Contract Settled WON, Profit: {profit}, Ticks: {actual_ticks})")
+                        asyncio.create_task(send_telegram_message(
+                            f"✅ <b>TRADE GAGNÉ</b>\n"
+                            f"Profit: <b>+{float(profit):.2f}$</b>\n"
+                            f"Ticks survécus: <b>{actual_ticks}</b>"
+                        ))
                     else:
                         logger.info(f"[RESULT]\n{status.upper()} (Profit: {profit}, Ticks: {actual_ticks})")
+                        asyncio.create_task(send_telegram_message(
+                            f"❌ <b>TRADE PERDU</b>\n"
+                            f"Perte: <b>{float(profit):.2f}$</b>\n"
+                            f"Ticks survécus: <b>{actual_ticks}</b>"
+                        ))
                     
                     if status == 'lost':
                         consecutive_losses += 1
@@ -425,9 +490,13 @@ Signal détecté : OUI
                             t_mom = latest_row_data.get('roc_10', 0)
                             t_vol = latest_row_data.get('tick_volatility_14', 0)
                             logger.info(f"[LOSS DIAGNOSTICS] Dist_BB={dist_bb:.4f}%, Tick_Mom={t_mom:.4f}, Tick_Vol={t_vol:.4f}")
+                            
+                            trade_pattern_hash = PatternRecognizer.get_pattern_hash(latest_row_data)
+                            db_manager.record_outcome(trade_pattern_hash, False)
+                            logger.info(f"Recorded LOSS for pattern {trade_pattern_hash}")
                         
                         # Dynamic ML Threshold Update (Stricter)
-                        dynamic_ml_threshold = min(0.90, dynamic_ml_threshold + 0.02)
+                        dynamic_ml_threshold = min(0.85, dynamic_ml_threshold + 0.02)
                         logger.warning(f"[BOT LOST] Becoming more strict! New Danger Threshold: {dynamic_ml_threshold:.2%} (Losses: {consecutive_losses}/3)")
                         
                         logger.info("Déclenchement du ré-entraînement de l'IA en tâche de fond...")
@@ -452,8 +521,14 @@ Signal détecté : OUI
                     
                     elif status == 'won':
                         consecutive_losses = 0
+                        
+                        if latest_row_data is not None:
+                            trade_pattern_hash = PatternRecognizer.get_pattern_hash(latest_row_data)
+                            db_manager.record_outcome(trade_pattern_hash, True)
+                            logger.info(f"Recorded WIN for pattern {trade_pattern_hash}")
+
                         # Regain confidence (Relax threshold slightly)
-                        dynamic_ml_threshold = max(0.80, dynamic_ml_threshold - 0.01)
+                        dynamic_ml_threshold = max(0.52, dynamic_ml_threshold - 0.01)
                         logger.info(f"[BOT WON] Regaining confidence. New Danger Threshold: {dynamic_ml_threshold:.2%}")
                     
                     try:
@@ -468,6 +543,11 @@ Signal détecté : OUI
                         max_loss = float(bot_settings.get("max_loss", 20.0))
                         if session_profit <= -max_loss:
                             logger.error(f"PERTE MAXIMALE ATTEINTE (${session_profit:.2f} <= -${max_loss:.2f}). ARRET D'URGENCE DU TRADING.")
+                            asyncio.create_task(send_telegram_message(
+                                f"🛑 <b>ARRÊT D'URGENCE</b>\n"
+                                f"La perte maximale autorisée ({max_loss}$) a été atteinte.\n"
+                                f"Solde session: <b>{session_profit:.2f}$</b>"
+                            ))
                             if ui_queue:
                                 ui_queue.put({"type": "status_update", "status": "MAX LOSS REACHED"})
                             is_trading = False
@@ -498,6 +578,7 @@ Signal détecté : OUI
                             
                     except (ValueError, TypeError):
                         pass
+                    last_trade_time = time.time()
                     is_trading = False
                     
             await execution.subscribe_to_open_contract(contract_id, on_contract_update)

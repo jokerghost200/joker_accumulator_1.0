@@ -6,3 +6,5 @@ scikit-learn
 joblib
 SQLAlchemy
 python-dotenv
+
+aiohttp
