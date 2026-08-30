@@ -104,12 +104,15 @@ async def main(ui_queue=None, bot_settings=None):
         
     session_profit = 0.0
     is_in_cooldown = False
+    emergency_stop = False
+    current_balance = 0.0
+    consecutive_losses = 0
     
     # 4. Define the Trading Loop Callback for Ticks
     async def process_new_tick(df):
-        nonlocal is_trading, last_eval_time, latest_bbu, latest_bbl, latest_bbm, dynamic_ml_threshold, latest_row_data, is_in_cooldown, session_profit
+        nonlocal is_trading, last_eval_time, latest_bbu, latest_bbl, latest_bbm, dynamic_ml_threshold, latest_row_data, is_in_cooldown, session_profit, emergency_stop, current_balance, consecutive_losses
         
-        if is_trading or is_in_cooldown:
+        if is_trading or is_in_cooldown or emergency_stop:
             return
             
         # Limit evaluations slightly to avoid overloading the CPU, e.g. every 2 seconds max
@@ -174,6 +177,8 @@ async def main(ui_queue=None, bot_settings=None):
         signal_detected = False
         
         # Apply Dynamic Prudence Mode
+        # RULE: Never go below 80% AI confidence minimum (Quality over Quantity)
+        dynamic_ml_threshold = max(0.80, dynamic_ml_threshold)
         current_threshold = dynamic_ml_threshold
         if session_profit > 0:
             prudence_bonus = session_profit * 0.015 # +1.5% for every $1 profit
@@ -202,18 +207,34 @@ async def main(ui_queue=None, bot_settings=None):
             best_contract_id = None
             best_ask_price = None
             best_tp_amount = None
+            best_stake = None
             
-            # Request all proposals in parallel
-            tp_amount = stake * (TAKE_PROFIT_PERCENT / 100.0)
-            
+            # Fetch balance if missing
+            if current_balance == 0.0 and auth.account_info:
+                current_balance = float(auth.account_info.get('balance', 0.0))
+                
+            base_stake = float(bot_settings.get("initial_stake", 5.0))
+                
+            # Request all proposals in parallel with dynamic TP based on UI stake
             tasks = []
             for rate in growth_rates_to_test:
+                if rate >= 0.04:
+                    # Very risky: We reduce the user's stake by half to be safe, min $1
+                    rate_stake = max(1.0, base_stake * 0.5)
+                    rate_tp_percent = 10.0
+                else:
+                    # Normal: We use the user's full stake
+                    rate_stake = base_stake
+                    rate_tp_percent = 15.0
+                    
+                rate_tp_amount = rate_stake * (rate_tp_percent / 100.0)
+                
                 tasks.append(execution.get_proposal(
                     symbol=SYMBOL, 
                     contract_type="ACCU", 
-                    stake=stake, 
+                    stake=round(rate_stake, 2), 
                     growth_rate=rate,
-                    limit_order={"take_profit": tp_amount}
+                    limit_order={"take_profit": round(rate_tp_amount, 2)}
                 ))
             
             proposals = await asyncio.gather(*tasks)
@@ -254,8 +275,17 @@ Signal détecté : OUI
                     log_msg += f"Growth {int(rate*100)}%: ERREUR (Barrière manquante)\n"
                     continue
                 
+                # Calculate dynamic TP and Stake again for this rate
+                if rate >= 0.04:
+                    rate_stake = max(1.0, base_stake * 0.5)
+                    rate_tp_percent = 10.0
+                else:
+                    rate_stake = base_stake
+                    rate_tp_percent = 15.0
+                rate_tp_amount = rate_stake * (rate_tp_percent / 100.0)
+
                 # Calculate target ticks based on the target profit formula
-                target_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + rate))
+                target_ticks = math.ceil(math.log(1 + (rate_tp_percent / 100.0)) / math.log(1 + rate))
                 
                 # Request survival probability from ML engine
                 prob_survive = ml_filter.predict_survival(enriched, target_ticks, barrier_percentage)
@@ -280,7 +310,8 @@ Signal détecté : OUI
                         best_rate = rate
                         best_contract_id = contract_id
                         best_ask_price = ask_price
-                        best_tp_amount = tp_amount
+                        best_tp_amount = rate_tp_amount
+                        best_stake = rate_stake
             
             log_msg += "\n[DECISION]\n"
             
@@ -305,7 +336,7 @@ Signal détecté : OUI
             if best_contract_id:
                 log_msg += f"Le bot choisit: {int(best_rate*100)}% offre le meilleur compromis avec une survie estimée de {best_prob:.2%}.\n"
                 logger.info(log_msg)
-                logger.info(f"*** EXECUTING ACCUMULATOR TRADE on {SYMBOL} for {stake} USD (TP: {best_tp_amount}$) ***")
+                logger.info(f"*** EXECUTING ACCUMULATOR TRADE on {SYMBOL} for {best_stake:.2f} USD (TP: {best_tp_amount:.2f}$) ***")
                 result = await execution.buy_contract(best_contract_id, best_ask_price)
                 if not result:
                     # En cas d'erreur API lors de l'achat, on relâche le verrou
@@ -335,16 +366,17 @@ Signal détecté : OUI
                 
         if result:
             contract_id = result.get('contract_id')
+            if result.get('balance_after'):
+                current_balance = float(result.get('balance_after'))
+                
             logger.info(f"Trade successfully placed. Bot will now wait for settlement. Contract ID: {contract_id}")
             is_trading = True
             contract_settled = False
+            sell_requested = False
             
             def on_contract_update(poc):
-                nonlocal is_trading
-                nonlocal dynamic_ml_threshold
-                nonlocal contract_settled
-                nonlocal session_profit
-                nonlocal is_in_cooldown
+                nonlocal is_trading, contract_settled, dynamic_ml_threshold, session_profit, is_in_cooldown, emergency_stop
+                nonlocal current_balance, consecutive_losses, sell_requested
                 
                 is_sold = poc.get('is_sold')
                 is_expired = poc.get('is_expired')
@@ -354,14 +386,28 @@ Signal détecté : OUI
                 actual_ticks = poc.get('tick_passed', poc.get('tick_count', 0))
                 current_spot = poc.get('current_spot')
                 
-                # Exit Logic: Let it ride to TP or crash (Pure AI Mode)
-                # (Accumulators cannot be sold unless sell_price > stake anyway)
-                
+                # Smart Exit Logic
+                if not is_sold and not is_expired and status == 'open' and not sell_requested:
+                    profit_val = float(profit) if profit else 0.0
+                    profit_pct = profit_val / best_stake if best_stake > 0 else 0
+                    
+                    if best_rate >= 0.04 and profit_pct >= 0.03 and actual_ticks >= 4:
+                        logger.info(f"Smart Exit [FAST RATE]: Profit {profit_pct:.2%} >= 3% after {actual_ticks} ticks. Selling!")
+                        sell_requested = True
+                        asyncio.create_task(execution.sell_contract(contract_id=poc.get('contract_id')))
+                    elif best_rate < 0.04 and profit_pct >= 0.05 and actual_ticks >= 6:
+                        logger.info(f"Smart Exit [SLOW RATE]: Profit {profit_pct:.2%} >= 5% after {actual_ticks} ticks. Selling!")
+                        sell_requested = True
+                        asyncio.create_task(execution.sell_contract(contract_id=poc.get('contract_id')))
+                        
                 if is_sold or is_expired or status in ['won', 'lost']:
                     if contract_settled:
                         return
                     contract_settled = True
                     
+                    if poc.get('balance_after'):
+                        current_balance = float(poc.get('balance_after'))
+                        
                     # API sometimes sends intermediate 'open' status even when sold
                     if status == 'open':
                         status = 'won' if float(profit) > 0 else 'lost'
@@ -372,6 +418,7 @@ Signal détecté : OUI
                         logger.info(f"[RESULT]\n{status.upper()} (Profit: {profit}, Ticks: {actual_ticks})")
                     
                     if status == 'lost':
+                        consecutive_losses += 1
                         # Diagnostics
                         if latest_row_data is not None:
                             dist_bb = latest_row_data.get('dist_bb_mid', 0)
@@ -381,12 +428,30 @@ Signal détecté : OUI
                         
                         # Dynamic ML Threshold Update (Stricter)
                         dynamic_ml_threshold = min(0.90, dynamic_ml_threshold + 0.02)
-                        logger.warning(f"[BOT LOST] Becoming more strict! New Danger Threshold: {dynamic_ml_threshold:.2%}")
+                        logger.warning(f"[BOT LOST] Becoming more strict! New Danger Threshold: {dynamic_ml_threshold:.2%} (Losses: {consecutive_losses}/3)")
                         
                         logger.info("Déclenchement du ré-entraînement de l'IA en tâche de fond...")
                         asyncio.create_task(background_retrain(df.copy()))
+                        
+                        if consecutive_losses >= 3:
+                            logger.error(f"3 PERTES CONSÉCUTIVES. PAUSE D'UNE HEURE POUR ANALYSER LE MARCHÉ.")
+                            if ui_queue:
+                                ui_queue.put({"type": "status_update", "status": "3 LOSSES (1H COOLDOWN)"})
+                            is_in_cooldown = True
+                            
+                            async def wait_long_cooldown():
+                                nonlocal is_in_cooldown, consecutive_losses
+                                await asyncio.sleep(3600)
+                                consecutive_losses = 0
+                                is_in_cooldown = False
+                                logger.info("Fin de la pause de 1 heure suite aux pertes. Reprise !")
+                                if ui_queue:
+                                    ui_queue.put({"type": "status_update", "status": "RUNNING"})
+                                    
+                            asyncio.create_task(wait_long_cooldown())
                     
                     elif status == 'won':
+                        consecutive_losses = 0
                         # Regain confidence (Relax threshold slightly)
                         dynamic_ml_threshold = max(0.80, dynamic_ml_threshold - 0.01)
                         logger.info(f"[BOT WON] Regaining confidence. New Danger Threshold: {dynamic_ml_threshold:.2%}")
@@ -406,6 +471,7 @@ Signal détecté : OUI
                             if ui_queue:
                                 ui_queue.put({"type": "status_update", "status": "MAX LOSS REACHED"})
                             is_trading = False
+                            emergency_stop = True
                             return
                             
                         # Cooldown check
