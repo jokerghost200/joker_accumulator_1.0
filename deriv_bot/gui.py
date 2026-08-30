@@ -34,6 +34,8 @@ class DerivBotApp(ctk.CTk):
         self.ui_queue = queue.Queue()
         self.bot_thread = None
         self.is_running = False
+        self.win_count = 0
+        self.loss_count = 0
         
         # Shared settings dict for the bot
         self.bot_settings = {
@@ -98,7 +100,14 @@ class DerivBotApp(ctk.CTk):
         self.status_label.grid(row=4, column=0, padx=20, pady=5)
         
         self.profit_label = ctk.CTkLabel(self.sidebar_frame, text="Profit: $0.00", text_color="cyan", font=ctk.CTkFont(size=16, weight="bold"))
-        self.profit_label.grid(row=5, column=0, padx=20, pady=(5, 20))
+        self.profit_label.grid(row=5, column=0, padx=20, pady=(5, 5))
+
+        self.stats_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.stats_frame.grid(row=6, column=0, padx=20, pady=(0, 20))
+        self.lbl_wins = ctk.CTkLabel(self.stats_frame, text="Victoires: 0", text_color="green", font=ctk.CTkFont(weight="bold"))
+        self.lbl_wins.pack(side="left", padx=5)
+        self.lbl_losses = ctk.CTkLabel(self.stats_frame, text="Défaites: 0", text_color="red", font=ctk.CTkFont(weight="bold"))
+        self.lbl_losses.pack(side="left", padx=5)
 
         # --- Main Content Area ---
         self.main_frame = ctk.CTkFrame(self)
@@ -229,6 +238,13 @@ class DerivBotApp(ctk.CTk):
                     # For Cooldown state
                     status = msg["status"]
                     self.status_label.configure(text=f"Status: {status}", text_color="orange")
+                elif msg["type"] == "trade_result":
+                    if msg["status"] == "won":
+                        self.win_count += 1
+                    else:
+                        self.loss_count += 1
+                    self.lbl_wins.configure(text=f"Victoires: {self.win_count}")
+                    self.lbl_losses.configure(text=f"Défaites: {self.loss_count}")
                 elif msg["type"] == "bot_stopped":
                     self.stop_bot()
         except queue.Empty:

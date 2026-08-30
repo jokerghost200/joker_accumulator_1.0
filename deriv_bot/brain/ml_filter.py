@@ -105,7 +105,7 @@ class MLFilter:
             # Random target ticks between 5 and 50
             scenario_df['target_ticks'] = np.random.randint(5, 50, size=len(scenario_df))
             
-            # Random barrier threshold between 0.003% and 0.01%
+            # Random barrier threshold between 0.003% and 0.010% (realistic for R_10 Accumulators)
             scenario_df['barrier_threshold'] = np.random.uniform(0.00003, 0.00010, size=len(scenario_df))
             
             scenarios.append(scenario_df)
@@ -143,11 +143,15 @@ class MLFilter:
                 targets[i] = np.nan
                 continue
                 
-            entry_price = closes[orig_idx]
-            future_prices = closes[orig_idx + 1 : end_idx]
+            # To calculate tick-to-tick changes, we need prices from orig_idx up to end_idx-1
+            # prices_for_calc length will be (end_idx - orig_idx), which is tt + 1
+            prices_for_calc = closes[orig_idx : end_idx]
             
-            # Max deviation from entry price as a percentage
-            max_deviation = np.max(np.abs(future_prices - entry_price) / entry_price)
+            # Calculate absolute pct change between consecutive ticks
+            pct_changes = np.abs(np.diff(prices_for_calc) / prices_for_calc[:-1])
+            
+            # Max tick-to-tick deviation
+            max_deviation = np.max(pct_changes) if len(pct_changes) > 0 else 0
             
             if max_deviation >= barrier:
                 targets[i] = 0 # Lost (hit barrier)
@@ -176,8 +180,16 @@ class MLFilter:
         y = training_df['target'].astype(int)
         
         logger.info(f"Training XGBoost on {len(X)} samples...")
-        self.model = XGBClassifier(n_estimators=150, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1, eval_metric='logloss')
-        self.model.fit(X, y)
+        new_model = XGBClassifier(
+            n_estimators=150, 
+            max_depth=6, 
+            learning_rate=0.1, 
+            random_state=42, 
+            n_jobs=-1,
+            eval_metric='logloss'
+        )
+        new_model.fit(X, y)
+        self.model = new_model
         self.is_trained = True
         
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
@@ -196,48 +208,3 @@ class MLFilter:
         report = classification_report(y, y_pred, target_names=["Knockout", "Survive"])
         logger.info(f"Classification Report:\n{report}")
 
-    def retrain_live(self, live_data_csv: str):
-        """
-        Retrains the model incorporating the live recorded data (Continuous Learning).
-        """
-        import threading
-        def _train_thread():
-            logger.info("Starting Auto-Learning (Continuous Learning) thread...")
-            try:
-                live_df = pd.read_csv(live_data_csv)
-                if len(live_df) < 50:
-                    logger.info("Not enough live data to retrain yet.")
-                    return
-                
-                # Limit to the most recent 10000 experiences to adapt to current market regime
-                live_df = live_df.tail(10000)
-                
-                X_live = self.prepare_features(live_df)
-                y_live = live_df['survived'].astype(int)
-                
-                # Check if we have both classes
-                if len(y_live.unique()) < 2:
-                    logger.warning("Live data contains only one class. Skipping retraining.")
-                    return
-                
-                logger.info(f"Retraining XGBoost with {len(X_live)} recent live experiences...")
-                
-                # Train a new model instance
-                new_model = XGBClassifier(n_estimators=150, max_depth=6, learning_rate=0.1, random_state=42, n_jobs=-1, eval_metric='logloss')
-                new_model.fit(X_live, y_live)
-                
-                # Swap out the old model safely
-                self.model = new_model
-                
-                # Save the new model
-                os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-                joblib.dump(self.model, self.model_path)
-                
-                accuracy = self.model.score(X_live, y_live)
-                logger.info(f"[AI] Auto-apprentissage terminé. Nouvelle précision: {accuracy:.2%}")
-                
-            except Exception as e:
-                logger.error(f"Error during auto-learning: {e}")
-                
-        # Run training in a background thread to prevent freezing the bot
-        threading.Thread(target=_train_thread, daemon=True).start()

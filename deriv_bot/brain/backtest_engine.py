@@ -75,13 +75,14 @@ class Backtester:
             
             # If we are in a trade, check outcome
             if active_trade:
-                # Check survival (Accumulators check distance from ENTRY price, not prev tick)
-                change = abs((current_price - active_trade['entry_price']) / active_trade['entry_price'])
+                # Check survival (Accumulators check distance from PREVIOUS tick, not entry price)
+                change = abs((current_price - active_trade['current_price']) / active_trade['current_price'])
                 if change >= active_trade['barrier']:
                     # Lost
                     losses += 1
                     active_trade = None
                 else:
+                    active_trade['current_price'] = current_price
                     active_trade['ticks_survived'] += 1
                     if active_trade['ticks_survived'] >= active_trade['target_ticks']:
                         # Won
@@ -127,6 +128,7 @@ class Backtester:
                         'barrier': best_barrier,
                         'ticks_survived': 0,
                         'entry_price': current_price,
+                        'current_price': current_price,
                         'profit': profit + stake # Return stake + profit
                     }
                     

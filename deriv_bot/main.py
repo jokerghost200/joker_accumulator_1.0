@@ -40,7 +40,6 @@ async def main(ui_queue=None, bot_settings=None):
     execution = ExecutionEngine(ws)
     
     # 3. Initialize Data & Brain components
-    cache = MarketDataCache(max_size=5000)
     feature_engine = FeatureEngine()
     ml_filter = MLFilter()
     auto_learner = AutoLearner()
@@ -58,23 +57,31 @@ async def main(ui_queue=None, bot_settings=None):
         
     is_trading = False
     
-    async def background_retrain():
+    is_retraining = False
+    
+    async def background_retrain(historical_df):
+        nonlocal is_retraining
+        if is_retraining:
+            logger.info("Un ré-entraînement est déjà en cours, on ignore la requête.")
+            return
+            
         try:
+            is_retraining = True
             logger.info("Extracting live history for background retraining...")
-            df = cache.get_dataframe()
-            if df.empty or len(df) < 500:
+            if historical_df.empty or len(historical_df) < 500:
                 logger.warning("Not enough data to retrain on the fly.")
                 return
-            enriched = feature_engine.enrich_data(df)
+            enriched = feature_engine.enrich_data(historical_df)
             
             def run_training():
                 ml_filter.train(enriched)
-                ml_filter.save_model()
                 
             await asyncio.to_thread(run_training)
-            logger.info("✅ Ré-entraînement terminé avec succès ! Le bot a appris de son erreur.")
+            logger.info("Re-entrainement termine avec succes ! Le bot a appris de son erreur.")
         except Exception as e:
             logger.error(f"Erreur lors du ré-entraînement en tâche de fond: {e}")
+        finally:
+            is_retraining = False
             
     import time
     last_eval_time = 0
@@ -128,7 +135,7 @@ async def main(ui_queue=None, bot_settings=None):
         new_outcomes = auto_learner.update_with_tick(close_price)
         if auto_learner.collected_outcomes >= 100:
             logger.info(f"Auto-Learning: 100 nouvelles expériences collectées. Déclenchement du ré-entraînement...")
-            ml_filter.retrain_live(auto_learner.csv_path)
+            asyncio.create_task(background_retrain(df.copy()))
             auto_learner.reset_counter()
         # --------------------------------------------
         latest_bbm = float(latest_row['bb_mid'])
@@ -153,7 +160,9 @@ async def main(ui_queue=None, bot_settings=None):
         
         for rate in growth_rates_to_test:
             # Approximate the barrier like in backtest to save API limits
-            approx_barrier = 0.0005 - (rate * 0.001)
+            # based on API responses: 1% -> 0.0000613, 5% -> 0.0000486
+            # We make it slightly tighter (subtract 0.0000010) to avoid false positives locally
+            approx_barrier = 0.0000645 - (0.0003175 * rate) - 0.0000010
             target_ticks = math.ceil(math.log(1 + (TAKE_PROFIT_PERCENT / 100.0)) / math.log(1 + rate))
             
             # Predict using XGBoost
@@ -164,16 +173,21 @@ async def main(ui_queue=None, bot_settings=None):
                 
         signal_detected = False
         
-        # Apply Prudence Mode if profit is $3 or more
+        # Apply Dynamic Prudence Mode
         current_threshold = dynamic_ml_threshold
-        if session_profit >= 3.0:
-            current_threshold = max(0.85, dynamic_ml_threshold)
+        if session_profit > 0:
+            prudence_bonus = session_profit * 0.015 # +1.5% for every $1 profit
+            current_threshold = min(0.95, dynamic_ml_threshold + prudence_bonus)
             
         if best_local_prob > current_threshold:
             signal_detected = True
         
         # 4. Fetch Proposals and AI Filter Confirmation
         if signal_detected:
+            # --- VERROU (LOCK) ---
+            # On bloque immédiatement les autres ticks pour éviter OpenPositionLimitExceeded
+            is_trading = True 
+            
             # We want to check all rates if Auto, or just one if specific
             growth_rate_setting = bot_settings.get('growth_rate_str', 'Auto')
             if growth_rate_setting == 'Auto':
@@ -255,19 +269,22 @@ Signal détecté : OUI
                     rate=rate
                 )
                 
-                decision = "BUY" if prob_survive > current_threshold else "WARN"
-                log_msg += f"Growth {int(rate*100)}% -> {prob_survive:.2%} ({decision}) [Ticks:{target_ticks}, Barrière:{barrier_percentage}%]\n"
+                status_str = "(BUY)" if prob_survive > current_threshold else "(WARN)"
+                log_msg += f"Growth {int(rate*100)}% -> {prob_survive:.2%} {status_str} [Ticks:{target_ticks}, Barrière:{barrier_percentage}%]\n"
                 
                 # Update best rate logic
-                if prob_survive > current_threshold and prob_survive > best_prob:
+                if prob_survive > best_prob:
                     best_prob = prob_survive
-                    best_rate = rate
-                    best_contract_id = contract_id
-                    best_ask_price = ask_price
-                    best_tp_amount = tp_amount
+                    
+                    if prob_survive > current_threshold:
+                        best_rate = rate
+                        best_contract_id = contract_id
+                        best_ask_price = ask_price
+                        best_tp_amount = tp_amount
             
             log_msg += "\n[DECISION]\n"
             
+            final_prob = best_prob if best_prob > 0 else best_local_prob
             # Envoyer les metrics à l'interface
             if ui_queue:
                 ui_queue.put({
@@ -280,18 +297,23 @@ Signal détecté : OUI
                     "rsi": float(latest_row.get('tick_rsi_14', 0)),
                     "squeeze": "Pure AI Mode",
                     "signal": signal_detected,
-                    "prob_safe": best_local_prob,
-                    "prob_danger": 1.0 - best_local_prob
+                    "prob_safe": final_prob,
+                    "prob_danger": 1.0 - final_prob
                 })
-
+                
+            result = None
             if best_contract_id:
                 log_msg += f"Le bot choisit: {int(best_rate*100)}% offre le meilleur compromis avec une survie estimée de {best_prob:.2%}.\n"
                 logger.info(log_msg)
                 logger.info(f"*** EXECUTING ACCUMULATOR TRADE on {SYMBOL} for {stake} USD (TP: {best_tp_amount}$) ***")
                 result = await execution.buy_contract(best_contract_id, best_ask_price)
+                if not result:
+                    # En cas d'erreur API lors de l'achat, on relâche le verrou
+                    is_trading = False
             else:
                 log_msg += "HOLD (Aucun taux ne dépasse le seuil de sécurité de l'IA)\n"
                 logger.info(log_msg)
+                is_trading = False
                 return
         else:
             # Send metrics to UI even if no signal
@@ -362,7 +384,7 @@ Signal détecté : OUI
                         logger.warning(f"[BOT LOST] Becoming more strict! New Danger Threshold: {dynamic_ml_threshold:.2%}")
                         
                         logger.info("Déclenchement du ré-entraînement de l'IA en tâche de fond...")
-                        asyncio.create_task(background_retrain())
+                        asyncio.create_task(background_retrain(df.copy()))
                     
                     elif status == 'won':
                         # Regain confidence (Relax threshold slightly)
@@ -375,11 +397,12 @@ Signal détecté : OUI
                         
                         if ui_queue:
                             ui_queue.put({"type": "profit_update", "profit": session_profit})
+                            ui_queue.put({"type": "trade_result", "status": status})
                             
                         # Max Loss check
                         max_loss = float(bot_settings.get("max_loss", 20.0))
                         if session_profit <= -max_loss:
-                            logger.error(f"🛑 PERTE MAXIMALE ATTEINTE (${session_profit:.2f} <= -${max_loss:.2f}). ARRÊT D'URGENCE DU TRADING.")
+                            logger.error(f"PERTE MAXIMALE ATTEINTE (${session_profit:.2f} <= -${max_loss:.2f}). ARRET D'URGENCE DU TRADING.")
                             if ui_queue:
                                 ui_queue.put({"type": "status_update", "status": "MAX LOSS REACHED"})
                             is_trading = False
@@ -389,7 +412,7 @@ Signal détecté : OUI
                         target = float(bot_settings.get("profit_threshold", 5.0))
                         if session_profit >= target:
                             cooldown_mins = float(bot_settings.get("cooldown_minutes", 60.0))
-                            logger.warning(f"🎯 Objectif de profit atteint (${session_profit:.2f} >= ${target:.2f}). Pause (Cooldown) pendant {cooldown_mins} minutes.")
+                            logger.warning(f"Objectif de profit atteint (${session_profit:.2f} >= ${target:.2f}). Pause (Cooldown) pendant {cooldown_mins} minutes.")
                             if ui_queue:
                                 ui_queue.put({"type": "status_update", "status": f"COOLDOWN ({cooldown_mins}m)"})
                             
@@ -400,7 +423,7 @@ Signal détecté : OUI
                                 await asyncio.sleep(cooldown_mins * 60)
                                 session_profit = 0.0
                                 is_in_cooldown = False
-                                logger.info("✅ Cooldown terminé ! Reprise du trading. Profit de session réinitialisé à 0.")
+                                logger.info("Cooldown termine ! Reprise du trading. Profit de session reinitialise a 0.")
                                 if ui_queue:
                                     ui_queue.put({"type": "profit_update", "profit": session_profit})
                                     ui_queue.put({"type": "status_update", "status": "RUNNING"})

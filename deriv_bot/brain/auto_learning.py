@@ -15,6 +15,7 @@ class VirtualTrade:
         self.barrier_pct = barrier_pct
         self.rate = rate
         self.entry_price = start_price
+        self.current_price = start_price
         self.ticks_survived = 0
 
 class AutoLearner:
@@ -57,8 +58,8 @@ class AutoLearner:
             for trade in self.active_trades:
                 trade.ticks_survived += 1
                 
-                # Check barrier relative to ENTRY price (Accumulator logic)
-                distance = abs(new_price - trade.entry_price) / trade.entry_price
+                # Check barrier relative to PREVIOUS price (Accumulator logic)
+                distance = abs(new_price - trade.current_price) / trade.current_price
                 
                 if distance >= trade.barrier_pct:
                     # KNOCKOUT
@@ -71,8 +72,8 @@ class AutoLearner:
                     finished_trades.append(trade)
                     new_outcomes += 1
                 else:
-                    # STILL ALIVE, no price update needed for Accumulator since we track entry price
-                    pass
+                    # STILL ALIVE, update current_price for next tick!
+                    trade.current_price = new_price
             
             # Remove finished trades
             for t in finished_trades:
